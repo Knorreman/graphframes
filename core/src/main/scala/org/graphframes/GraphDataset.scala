@@ -30,6 +30,9 @@ import org.apache.spark.sql.functions.countDistinct
 import org.apache.spark.sql.functions.explode
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.lib.AggregateMessagesDataset
+import org.graphframes.lib.AggregateNeighborsDataset
+import org.graphframes.lib.AllPathsDataset
+import org.graphframes.lib.BFSDataset
 import org.graphframes.lib.ClusterAssignment
 import org.graphframes.lib.ConnectedComponentsDataset
 import org.graphframes.lib.DetectingCyclesDataset
@@ -493,6 +496,38 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
   }
 
   // ============== Standard graph algorithms ============
+
+  /**
+   * Typed Breadth-First Search (BFS) finding shortest paths between vertices matching typed
+   * predicates.
+   *
+   * See [[org.graphframes.lib.BFSDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def bfs: BFSDataset[VD, ED] =
+    new BFSDataset[VD, ED](this)
+
+  /**
+   * Typed AllPaths algorithm enumerating all simple paths between vertices matching typed
+   * predicates.
+   *
+   * See [[org.graphframes.lib.AllPathsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def allPaths: AllPathsDataset[VD, ED] =
+    new AllPathsDataset[VD, ED](this)
+
+  /**
+   * Typed multi-hop neighbor traversal and accumulation.
+   *
+   * See [[org.graphframes.lib.AggregateNeighborsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def aggregateNeighbors: AggregateNeighborsDataset[VD, ED] =
+    new AggregateNeighborsDataset[VD, ED](this)
 
   /**
    * Typed message aggregation builder for sending and aggregating messages across graph triplets.

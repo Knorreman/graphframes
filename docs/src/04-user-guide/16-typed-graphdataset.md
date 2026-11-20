@@ -152,6 +152,37 @@ val shortest = weightedGraph.pregel
   )
 ```
 
+## Typed Traversals (`bfs`, `allPaths`, `aggregateNeighbors`)
+
+```scala
+// Breadth-First Search -> Dataset[GraphPath[VD, ED]]
+val shortestPaths = g.bfs
+  .fromPred(_.attr.name == "Alice")
+  .toPred(_.attr.name == "Charlie")
+  .edgeFilter(_.attr.kind == "friend")
+  .maxPathLength(5)
+  .run()
+
+// All Simple Paths -> Dataset[SimplePath]
+val allSimple = g.allPaths
+  .fromPred(_.attr.name == "Alice")
+  .toPred(_.attr.name == "Charlie")
+  .maxPathLength(4)
+  .setUseLocalCheckpoints(true)
+  .run()
+
+// Multi-Hop Neighbor Aggregation -> Dataset[NeighborAggregateResult[S]]
+val traversed = g.aggregateNeighbors
+  .setStartingVertices(_.attr.name == "Alice")
+  .setMaxHops(3)
+  .setUseLocalCheckpoints(true)
+  .withAccumulator[Double](
+    init = _ => 0.0,
+    update = (weightSum, triplet) => weightSum + triplet.attr.weight)
+  .setTargetCondition((_, triplet) => triplet.dstAttr.name == "Charlie")
+  .run()
+```
+
 ## Standard Graph Algorithms
 
 `GraphDataset` wraps the standard `GraphFrame` topology algorithms with strongly typed results:
