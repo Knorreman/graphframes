@@ -26,6 +26,8 @@ import org.graphframes.SparkFunSuite
 import org.scalactic.Tolerance.*
 
 case class UserProfile(name: String, age: Int)
+case class LinkMeta(kind: String, bonus: Int)
+case class AgeSummary(totalAge: Int, count: Int)
 
 private object AvgIntAggregator extends Aggregator[Int, (Long, Long), Double] {
   override def zero: (Long, Long) = (0L, 0L)
@@ -128,5 +130,25 @@ class AggregateMessagesDatasetSuite extends SparkFunSuite with GraphFrameTestSpa
     intercept[IllegalArgumentException] {
       g.aggregateMessages[Int].agg(_ + _)
     }
+  }
+
+  test("custom case class VD, ED, and message type deserialize cleanly") {
+    val vertices = spark.createDataset(
+      Seq(
+        GraphVertex(1L, UserProfile("Alice", 30)),
+        GraphVertex(2L, UserProfile("Bob", 40)),
+        GraphVertex(3L, UserProfile("Charlie", 50))))
+    val edges = spark.createDataset(
+      Seq(GraphEdge(1L, 3L, LinkMeta("friend", 2)), GraphEdge(2L, 3L, LinkMeta("colleague", 1))))
+    val g = GraphDataset(vertices, edges)
+
+    val agg = g
+      .aggregateMessages[AgeSummary]
+      .sendToDst(t => AgeSummary(t.srcAttr.age + t.attr.bonus, 1))
+      .agg((a, b) => AgeSummary(a.totalAge + b.totalAge, a.count + b.count))
+      .collect()
+      .toMap
+
+    assert(agg === Map(3L -> AgeSummary(73, 2)))
   }
 }

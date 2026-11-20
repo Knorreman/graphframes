@@ -24,6 +24,8 @@ import org.graphframes.SparkFunSuite
 import org.scalactic.Tolerance.*
 
 case class PathMsg(dist: Int, via: VertexId)
+case class NodeState(label: String, dist: Int)
+case class WeightedLink(kind: String, cost: Int)
 
 class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
 
@@ -220,5 +222,39 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
     assert(result.vertices.collect().map(v => v.id -> v.attr).toMap === Map(1L -> 15, 2L -> 25))
     result.vertices.unpersist()
     sc.setJobDescription(null)
+  }
+
+  test("custom case class VD, ED, and message types deserialize cleanly") {
+    val vv = spark.createDataset(
+      Seq(
+        GraphVertex(1L, NodeState("start", 0)),
+        GraphVertex(2L, NodeState("mid", Int.MaxValue)),
+        GraphVertex(3L, NodeState("end", Int.MaxValue))))
+    val ee = spark.createDataset(
+      Seq(GraphEdge(1L, 2L, WeightedLink("road", 4)), GraphEdge(2L, 3L, WeightedLink("rail", 6))))
+    val g = GraphDataset(vv, ee)
+
+    val result = g.pregel
+      .setMaxIter(5)
+      .setCheckpointInterval(2)
+      .setActiveDirection(EdgeDirection.Out)
+      .withMessages[PathMsg](PathMsg(Int.MaxValue, -1L))
+      .vprog((_, state, msg) => if (msg.dist < state.dist) state.copy(dist = msg.dist) else state)
+      .sendMsgToDstOpt(t =>
+        if (t.srcAttr.dist != Int.MaxValue && t.srcAttr.dist + t.attr.cost < t.dstAttr.dist) {
+          Some(PathMsg(t.srcAttr.dist + t.attr.cost, t.srcId))
+        } else {
+          None
+        })
+      .mergeMsg((a, b) => if (a.dist <= b.dist) a else b)
+      .run()
+
+    val states = result.vertices.collect().map(v => v.id -> v.attr).toMap
+    assert(
+      states === Map(
+        1L -> NodeState("start", 0),
+        2L -> NodeState("mid", 4),
+        3L -> NodeState("end", 10)))
+    result.vertices.unpersist()
   }
 }

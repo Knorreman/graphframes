@@ -252,18 +252,46 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     gMissing.validate(checkVertices = false, StorageLevel.MEMORY_ONLY)
   }
 
-  test("custom case class attributes") {
+  test("custom case class attributes across DataFrame/GraphFrame boundaries") {
     import sqlImplicits.*
     val vv = spark.createDataset(
-      Seq(GraphVertex(1L, PersonAttr("Alice", 30)), GraphVertex(2L, PersonAttr("Bob", 25))))
+      Seq(
+        GraphVertex(1L, PersonAttr("Alice", 30)),
+        GraphVertex(2L, PersonAttr("Bob", 25)),
+        GraphVertex(3L, PersonAttr("Charlie", 40))))
     val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, RelationAttr("friend", 0.9))))
     val g = GraphDataset(vv, ee)
 
+    // triplets (DataFrame join -> .as[GraphTriplet[PersonAttr, RelationAttr]])
     val triplets = g.triplets.collect()
     assert(triplets.length === 1)
     assert(triplets.head.srcAttr === PersonAttr("Alice", 30))
     assert(triplets.head.dstAttr === PersonAttr("Bob", 25))
     assert(triplets.head.attr === RelationAttr("friend", 0.9))
+
+    // toGraphFrame -> fromGraphFrame round-trip with struct attr columns
+    val roundTripped = GraphDataset.fromGraphFrame[PersonAttr, RelationAttr](g.toGraphFrame)
+    assert(roundTripped.vertices.collect().toSet === vv.collect().toSet)
+    assert(roundTripped.edges.collect().toSet === ee.collect().toSet)
+
+    // filterVertices (DataFrame left_semi join -> .as[GraphEdge[RelationAttr]])
+    val filtered = g.filterVertices(_.attr.age <= 30)
+    assert(
+      filtered.vertices.collect().toSet === Set(
+        GraphVertex(1L, PersonAttr("Alice", 30)),
+        GraphVertex(2L, PersonAttr("Bob", 25))))
+    assert(filtered.edges.collect().toSet === Set(GraphEdge(1L, 2L, RelationAttr("friend", 0.9))))
+
+    // dropIsolatedVertices (DataFrame left_semi join -> .as[GraphVertex[PersonAttr]])
+    val connected = g.dropIsolatedVertices()
+    assert(
+      connected.vertices.collect().toSet === Set(
+        GraphVertex(1L, PersonAttr("Alice", 30)),
+        GraphVertex(2L, PersonAttr("Bob", 25))))
+
+    // connectedComponents (wraps GraphFrame.connectedComponents with struct attrs)
+    val cc = g.connectedComponents.run().collect().map(r => r.id -> r.connectedComponent).toMap
+    assert(cc === Map(1L -> 1L, 2L -> 1L, 3L -> 3L))
   }
 
   test("toGraphX conversion") {
