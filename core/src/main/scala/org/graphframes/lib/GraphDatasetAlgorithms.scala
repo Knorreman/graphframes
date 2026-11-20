@@ -17,9 +17,12 @@
 
 package org.graphframes.lib
 
+import org.apache.spark.ml.feature.Word2Vec
+import org.apache.spark.ml.functions.vector_to_array
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.Encoders
+import org.apache.spark.sql.functions.array
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.functions.struct
 import org.graphframes.GraphDataset
@@ -32,6 +35,9 @@ import org.graphframes.WithIntermediateStorageLevel
 import org.graphframes.WithLgNomEntries
 import org.graphframes.WithLocalCheckpoints
 import org.graphframes.WithMaxIter
+import org.graphframes.embeddings.Hash2Vec
+import org.graphframes.embeddings.RandomWalkEmbeddings
+import org.graphframes.rw.RandomWalkBase
 
 import scala.reflect.runtime.universe.TypeTag
 
@@ -353,5 +359,323 @@ class DetectingCyclesDataset[VD, ED] private[graphframes] (
       .run()
       .select(col(DetectingCycles.foundSeqCol))
       .as[Seq[VertexId]]
+  }
+}
+
+/**
+ * Vertex attribute augmented with Parallel Personalized PageRank scores (aligned with the
+ * configured `sourceIds`).
+ */
+case class PersonalizedPageRankAttr[VD](attr: VD, pageranks: Seq[Double]) extends Serializable
+
+object PersonalizedPageRankAttr {
+  implicit def encoder[VD: TypeTag]: Encoder[PersonalizedPageRankAttr[VD]] =
+    Encoders.product[PersonalizedPageRankAttr[VD]]
+}
+
+/**
+ * Parallel Personalized PageRank algorithm for [[org.graphframes.GraphDataset]], wrapping
+ * [[ParallelPersonalizedPageRank]].
+ */
+class ParallelPersonalizedPageRankDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
+    private val graph: GraphDataset[VD, ED])
+    extends Arguments
+    with WithMaxIter
+    with Logging {
+
+  private var resetProb: Double = 0.15
+  private var srcIds: Array[VertexId] = Array.empty
+
+  /** Source vertices for Personalized PageRank. */
+  def sourceIds(values: Array[VertexId]): this.type = {
+    srcIds = values
+    this
+  }
+
+  /** Source vertices for Personalized PageRank. */
+  def sourceIds(values: Seq[VertexId]): this.type = {
+    srcIds = values.toArray
+    this
+  }
+
+  /** Reset probability "alpha" (default: 0.15). */
+  def resetProbability(value: Double): this.type = {
+    resetProb = value
+    this
+  }
+
+  /**
+   * Runs Parallel Personalized PageRank and returns a [[GraphDataset]] with
+   * [[PersonalizedPageRankAttr]] vertex attributes and [[WeightedEdgeAttr]] edge attributes.
+   */
+  def run(): GraphDataset[PersonalizedPageRankAttr[VD], WeightedEdgeAttr[ED]] = {
+    val maxIterChecked = check(maxIter, "maxIter")
+    val ppr = graph.toGraphFrame.parallelPersonalizedPageRank
+      .maxIter(maxIterChecked)
+      .resetProbability(resetProb)
+      .sourceIds(srcIds.map(id => id: Any))
+
+    val resGF = ppr.run()
+    val vv = resGF.vertices
+      .select(
+        col(GraphFrame.ID).alias("id"),
+        struct(
+          col(GraphFrame.ATTR).alias("attr"),
+          vector_to_array(col("pageranks")).alias("pageranks")).alias("attr"))
+      .as[GraphVertex[PersonalizedPageRankAttr[VD]]]
+    val ee = resGF.edges
+      .select(
+        col(GraphFrame.SRC).alias("srcId"),
+        col(GraphFrame.DST).alias("dstId"),
+        struct(col(GraphFrame.ATTR).alias("attr"), col("weight").alias("weight")).alias("attr"))
+      .as[GraphEdge[WeightedEdgeAttr[ED]]]
+    GraphDataset(vv, ee)
+  }
+}
+
+/**
+ * Structure-Aware Label Propagation algorithm for [[org.graphframes.GraphDataset]], wrapping
+ * [[StructureAwareLabelPropagation]].
+ *
+ * Note: requires Apache Spark 4.1 or newer.
+ */
+class StructureAwareLabelPropagationDataset[VD, ED] private[graphframes] (
+    private val graph: GraphDataset[VD, ED])
+    extends Arguments
+    with WithCheckpointInterval
+    with WithMaxIter
+    with WithLocalCheckpoints
+    with WithIntermediateStorageLevel
+    with WithDirection
+    with WithLgNomEntries
+    with Logging {
+
+  private var structuralSimilarityMultiplier: Double = 0.5
+  private var ignoreDirectLinks: Boolean = false
+
+  /** Sets whether direct-link baseline vote mass is ignored (default: `false`). */
+  def setIgnoreDirectLinks(value: Boolean): this.type = {
+    ignoreDirectLinks = value
+    this
+  }
+
+  /** Sets the multiplier for the neighborhood-overlap signal (default: `0.5`). */
+  def setStructuralSimilarityMultiplier(value: Double): this.type = {
+    require(value >= 0.0, "structuralSimilarityMultiplier must be >= 0")
+    structuralSimilarityMultiplier = value
+    this
+  }
+
+  private def configure(gf: GraphFrame): StructureAwareLabelPropagation = {
+    val maxIterChecked = check(maxIter, "maxIter")
+    gf.structureAwareLabelPropagation
+      .maxIter(maxIterChecked)
+      .setCheckpointInterval(checkpointInterval)
+      .setUseLocalCheckpoints(useLocalCheckpoints)
+      .setIntermediateStorageLevel(intermediateStorageLevel)
+      .setIsDirected(isDirected)
+      .setLgNomEntries(lgNomEntries)
+      .setIgnoreDirectLinks(ignoreDirectLinks)
+      .setStructuralSimilarityMultiplier(structuralSimilarityMultiplier)
+  }
+
+  /**
+   * Runs structure-aware label propagation using each vertex's own ID as its initial label.
+   */
+  def run(): Dataset[LabelPropagationResult] = {
+    configure(graph.toGraphFrame)
+      .run()
+      .select(col(GraphFrame.ID).alias("id"), col("label").cast("long").alias("label"))
+      .as[LabelPropagationResult]
+  }
+
+  /**
+   * Runs attribute-guided structure-aware label propagation initialized from a typed function
+   * `extractLabel` applied to each vertex.
+   */
+  def runWithInitialLabel[L: TypeTag](
+      extractLabel: GraphVertex[VD] => L): Dataset[GraphVertex[L]] = {
+    val initCol = "_gf_init_label"
+    val gf = graph.toGraphFrame
+    val labeledV = graph.vertices
+      .map(v => GraphVertex(v.id, extractLabel(v)))
+      .toDF(GraphFrame.ID, initCol)
+    val preparedGF = GraphFrame(labeledV, gf.edges)
+    configure(preparedGF)
+      .setInitialLabelCol(initCol)
+      .run()
+      .select(col(GraphFrame.ID).alias("id"), col("label").alias("attr"))
+      .as[GraphVertex[L]]
+  }
+}
+
+/**
+ * Result row for [[HyperANFDataset]], containing compact HyperLogLog sketches for hops
+ * `0..nHops`.
+ *
+ * `hopSketches(k)` stores the compact HyperLogLog sketch bytes for vertices reachable in exactly
+ * `k` directed hops from `id`.
+ */
+case class HyperANFResult(id: VertexId, hopSketches: Seq[Array[Byte]]) extends Serializable {
+  def numHops: Int = hopSketches.size - 1
+}
+
+object HyperANFResult {
+  implicit val encoder: Encoder[HyperANFResult] =
+    Encoders.product[HyperANFResult]
+}
+
+/**
+ * HyperANF approximate neighbourhood function algorithm for [[org.graphframes.GraphDataset]],
+ * wrapping [[HyperANF]].
+ */
+class HyperANFDataset[VD, ED] private[graphframes] (private val graph: GraphDataset[VD, ED])
+    extends Serializable
+    with Logging
+    with WithCheckpointInterval
+    with WithIntermediateStorageLevel
+    with WithLocalCheckpoints {
+
+  private var nHops: Int = 3
+  private var lgNomEntries: Int = 12
+  private var edgePredicate: Option[GraphEdge[ED] => Boolean] = None
+
+  /** Sets the log2 of nominal entries used by HLL sketch aggregations (between 4 and 21). */
+  def setLgNomEntries(value: Int): this.type = {
+    require((value >= 4) && (value <= 21), "lgNomEntries must be between 4 and 21")
+    lgNomEntries = value
+    this
+  }
+
+  /** Sets the maximum hop distance to compute (must be > 0, default: 3). */
+  def setNHops(value: Int): this.type = {
+    require(value > 0, "n-hops cannot be negative or zero")
+    nHops = value
+    this
+  }
+
+  /** Restricts the HyperANF expansion to edges matching the given typed predicate. */
+  def filterEdges(predicate: GraphEdge[ED] => Boolean): this.type = {
+    edgePredicate = Some(predicate)
+    this
+  }
+
+  /** Runs HyperANF and returns a typed dataset of [[HyperANFResult]]. */
+  def run(): Dataset[HyperANFResult] = {
+    val targetGraph = edgePredicate.map(graph.filterEdges).getOrElse(graph)
+    val resDF = targetGraph.toGraphFrame.hyperANF
+      .setNHops(nHops)
+      .setLgNomEntries(lgNomEntries)
+      .setCheckpointInterval(checkpointInterval)
+      .setUseLocalCheckpoints(useLocalCheckpoints)
+      .setIntermediateStorageLevel(intermediateStorageLevel)
+      .run()
+
+    val hopCols = (0 to nHops).map(h => col(s"hop_$h"))
+    resDF
+      .select(col(GraphFrame.ID).alias("id"), array(hopCols: _*).alias("hopSketches"))
+      .as[HyperANFResult]
+  }
+}
+
+/**
+ * Result row for [[RandomWalkEmbeddingsDataset]], containing a vertex ID and embedding vector.
+ */
+case class NodeEmbeddingResult(id: VertexId, embedding: Seq[Double])
+    extends GraphVertexBase[Seq[Double]] {
+  def attr: Seq[Double] = embedding
+  def toVertex: GraphVertex[Seq[Double]] = GraphVertex(id, embedding)
+}
+
+object NodeEmbeddingResult {
+  implicit val encoder: Encoder[NodeEmbeddingResult] =
+    Encoders.product[NodeEmbeddingResult]
+}
+
+/**
+ * Random-walk-based node embeddings for [[org.graphframes.GraphDataset]], wrapping
+ * [[org.graphframes.embeddings.RandomWalkEmbeddings]].
+ */
+class RandomWalkEmbeddingsDataset[VD, ED] private[graphframes] (
+    private val graph: GraphDataset[VD, ED])
+    extends Serializable
+    with Logging
+    with WithIntermediateStorageLevel {
+
+  private var sequenceModel: Option[Either[Word2Vec, Hash2Vec]] = None
+  private var randomWalks: Option[RandomWalkBase] = None
+  private var aggregateNeighbors: Boolean = true
+  private var useEdgeDirections: Boolean = false
+  private var maxNbrs: Int = 50
+  private var seed: Long = 42L
+  private var cachedRwPath: Option[String] = None
+  private var cleanUpAfterRun: Boolean = false
+
+  /** Sets the sequence model (`Left(Word2Vec)` or `Right(Hash2Vec)`). */
+  def setSequenceModel(value: Either[Word2Vec, Hash2Vec]): this.type = {
+    sequenceModel = Some(value)
+    this
+  }
+
+  /** Sets the random walk generator. */
+  def setRandomWalks(value: RandomWalkBase): this.type = {
+    randomWalks = Some(value)
+    this
+  }
+
+  /** Sets the random seed (default: 42L). */
+  def setSeed(value: Long): this.type = {
+    seed = value
+    this
+  }
+
+  /** Sets whether to use edge directions (default: `false`). */
+  def setUseEdgeDirections(value: Boolean): this.type = {
+    useEdgeDirections = value
+    this
+  }
+
+  /** Sets whether to aggregate neighbor embeddings via min-hash sampling (default: `true`). */
+  def setAggregateNeighbors(value: Boolean): this.type = {
+    aggregateNeighbors = value
+    this
+  }
+
+  /** Sets the maximum number of neighbors sampled for aggregation (default: 50). */
+  def setMaxNbrs(value: Int): this.type = {
+    maxNbrs = value
+    this
+  }
+
+  /** Sets a path to pre-computed cached random walks in Parquet format. */
+  def useCachedRandomWalks(path: String): this.type = {
+    cachedRwPath = Some(path)
+    this
+  }
+
+  /** Sets whether to clean up temporary walk files after running (default: `false`). */
+  def setCleanUpAfterRun(value: Boolean): this.type = {
+    cleanUpAfterRun = value
+    this
+  }
+
+  /** Runs random-walk node embeddings and returns a typed dataset of [[NodeEmbeddingResult]]. */
+  def run(): Dataset[NodeEmbeddingResult] = {
+    val rw = graph.toGraphFrame.randomWalksBasedEmbedding
+      .setIntermediateStorageLevel(intermediateStorageLevel)
+      .setSeed(seed)
+      .setUseEdgeDirections(useEdgeDirections)
+      .setAggregateNeighbors(aggregateNeighbors)
+      .setMaxNbrs(maxNbrs)
+      .setCleanUpAfterRun(cleanUpAfterRun)
+    sequenceModel.foreach(rw.setSequenceModel)
+    randomWalks.foreach(rw.setRandomWalks)
+    cachedRwPath.foreach(rw.useCachedRandomWalks)
+
+    rw.run()
+      .select(
+        col(GraphFrame.ID).cast("long").alias("id"),
+        vector_to_array(col(RandomWalkEmbeddings.embeddingColName)).alias("embedding"))
+      .as[NodeEmbeddingResult]
   }
 }

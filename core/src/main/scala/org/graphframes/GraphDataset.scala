@@ -34,13 +34,17 @@ import org.graphframes.lib.DetectingCyclesDataset
 import org.graphframes.lib.GraphEdge
 import org.graphframes.lib.GraphTriplet
 import org.graphframes.lib.GraphVertex
+import org.graphframes.lib.HyperANFDataset
 import org.graphframes.lib.KCoreDataset
 import org.graphframes.lib.LabelPropagationDataset
 import org.graphframes.lib.MaximalIndependentSetDataset
 import org.graphframes.lib.PageRankDataset
+import org.graphframes.lib.ParallelPersonalizedPageRankDataset
 import org.graphframes.lib.PregelGraphDataset
+import org.graphframes.lib.RandomWalkEmbeddingsDataset
 import org.graphframes.lib.ShortestPathsDataset
 import org.graphframes.lib.StronglyConnectedComponentsDataset
+import org.graphframes.lib.StructureAwareLabelPropagationDataset
 import org.graphframes.lib.TriangleCountDataset
 import org.graphframes.lib.VertexId
 
@@ -541,6 +545,46 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    */
   def detectingCycles: DetectingCyclesDataset[VD, ED] =
     new DetectingCyclesDataset[VD, ED](this)
+
+  /**
+   * Parallel Personalized PageRank algorithm.
+   *
+   * See [[org.graphframes.lib.ParallelPersonalizedPageRankDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def parallelPersonalizedPageRank: ParallelPersonalizedPageRankDataset[VD, ED] =
+    new ParallelPersonalizedPageRankDataset[VD, ED](this)
+
+  /**
+   * Structure-aware label propagation algorithm (requires Spark 4.1+).
+   *
+   * See [[org.graphframes.lib.StructureAwareLabelPropagationDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def structureAwareLabelPropagation: StructureAwareLabelPropagationDataset[VD, ED] =
+    new StructureAwareLabelPropagationDataset[VD, ED](this)
+
+  /**
+   * Approximate neighborhood function backed by HyperLogLog sketches.
+   *
+   * See [[org.graphframes.lib.HyperANFDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def hyperANF: HyperANFDataset[VD, ED] =
+    new HyperANFDataset[VD, ED](this)
+
+  /**
+   * Random-walk-based node embeddings.
+   *
+   * See [[org.graphframes.lib.RandomWalkEmbeddingsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def randomWalksBasedEmbedding: RandomWalkEmbeddingsDataset[VD, ED] =
+    new RandomWalkEmbeddingsDataset[VD, ED](this)
 }
 
 object GraphDataset extends Serializable with Logging {

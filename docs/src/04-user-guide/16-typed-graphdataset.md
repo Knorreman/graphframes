@@ -188,6 +188,19 @@ val mis = g.maximalIndependentSet.setUseLocalCheckpoints(true).run(seed = 42L)
 
 // Cycle Detection -> Dataset[Seq[VertexId]]
 val cycles = g.detectingCycles.setUseLocalCheckpoints(true).run()
+
+// Parallel Personalized PageRank -> GraphDataset[PersonalizedPageRankAttr[VD], WeightedEdgeAttr[ED]]
+val ppr = g.parallelPersonalizedPageRank.sourceIds(Seq(1L, 2L)).maxIter(5).run()
+
+// Structure-Aware Label Propagation (Spark 4.1+) -> Dataset[LabelPropagationResult]
+// or attribute-guided via runWithInitialLabel(_.attr) -> Dataset[GraphVertex[L]]
+val salp = g.structureAwareLabelPropagation.maxIter(5).setUseLocalCheckpoints(true).run()
+
+// HyperANF -> Dataset[HyperANFResult]
+val anf = g.hyperANF.setNHops(3).run()
+
+// Random-Walk Node Embeddings -> Dataset[NodeEmbeddingResult]
+val emb = g.randomWalksBasedEmbedding.setRandomWalks(rw).setSequenceModel(Right(h2v)).run()
 ```
 
 ## Saving and Loading

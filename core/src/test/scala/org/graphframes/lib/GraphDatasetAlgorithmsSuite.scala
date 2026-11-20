@@ -17,9 +17,17 @@
 
 package org.graphframes.lib
 
+import org.apache.commons.io.FileUtils
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.hll_sketch_estimate
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrameTestSparkContext
+import org.graphframes.GraphFramesSparkVersionException
 import org.graphframes.SparkFunSuite
+import org.graphframes.embeddings.Hash2Vec
+import org.graphframes.rw.RandomWalkWithRestart
+
+import java.nio.file.Files
 
 case class CityInfo(name: String, pop: Int)
 case class RoadInfo(highway: String, lanes: Int)
@@ -165,5 +173,153 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
       .toSet
 
     assert(cycles === Set(Seq(1L, 2L, 3L, 1L)))
+  }
+
+  test("parallelPersonalizedPageRank preserves custom case class VD and ED") {
+    val vv = spark.createDataset(
+      Seq(
+        GraphVertex(1L, CityInfo("A", 100)),
+        GraphVertex(2L, CityInfo("B", 200)),
+        GraphVertex(3L, CityInfo("C", 300))))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, RoadInfo("I-1", 2)),
+        GraphEdge(2L, 3L, RoadInfo("I-2", 4)),
+        GraphEdge(3L, 1L, RoadInfo("I-3", 2))))
+    val g = GraphDataset(vv, ee)
+
+    val ppr = g.parallelPersonalizedPageRank
+      .sourceIds(Seq(1L, 2L))
+      .resetProbability(0.15)
+      .maxIter(5)
+      .run()
+
+    val verts = ppr.vertices.collect().map(v => v.id -> v.attr).toMap
+    assert(verts.keySet === Set(1L, 2L, 3L))
+    assert(verts(1L).attr === CityInfo("A", 100))
+    assert(verts(1L).pageranks.size === 2)
+    assert(verts(1L).pageranks(0) > verts(1L).pageranks(1))
+
+    val edges = ppr.edges.collect().map(e => (e.srcId, e.dstId) -> e.attr).toMap
+    assert(edges((1L, 2L)).attr === RoadInfo("I-1", 2))
+    assert(edges((1L, 2L)).weight === 1.0)
+  }
+
+  test("hyperANF returns hop sketches and supports typed edge filtering") {
+    val vv = spark.createDataset((1L to 5L).map(i => GraphVertex(i, s"v$i")))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, "keep"),
+        GraphEdge(1L, 3L, "keep"),
+        GraphEdge(2L, 4L, "keep"),
+        GraphEdge(3L, 4L, "keep"),
+        GraphEdge(4L, 5L, "keep"),
+        GraphEdge(5L, 1L, "keep")))
+    val g = GraphDataset(vv, ee)
+
+    val res = g.hyperANF.setNHops(2).setLgNomEntries(12).run()
+    val collected = res.collect()
+    assert(collected.map(_.id).toSet === (1L to 5L).toSet)
+    collected.foreach(r => assert(r.numHops === 2))
+
+    val estimates = res
+      .select(
+        col("id"),
+        hll_sketch_estimate(col("hopSketches")(0)).alias("h0"),
+        hll_sketch_estimate(col("hopSketches")(1)).alias("h1"),
+        hll_sketch_estimate(col("hopSketches")(2)).alias("h2"))
+      .collect()
+      .map(r => r.getLong(0) -> Seq(r.getLong(1), r.getLong(2), r.getLong(3)))
+      .toMap
+
+    assert(
+      estimates === Map(
+        1L -> Seq(1L, 2L, 1L),
+        2L -> Seq(1L, 1L, 1L),
+        3L -> Seq(1L, 1L, 1L),
+        4L -> Seq(1L, 1L, 1L),
+        5L -> Seq(1L, 1L, 2L)))
+
+    val filtered = g.hyperANF
+      .setNHops(1)
+      .filterEdges(_.srcId == 1L)
+      .run()
+      .collect()
+    assert(filtered.map(_.id).toSet === Set(1L))
+  }
+
+  test("structureAwareLabelPropagation") {
+    val vv = spark.createDataset((1L to 6L).map(i => GraphVertex(i, if (i <= 3L) "c1" else "c2")))
+    val clique1 = for { i <- 1L to 3L; j <- 1L to 3L if i != j } yield GraphEdge(i, j, 1)
+    val clique2 = for { i <- 4L to 6L; j <- 4L to 6L if i != j } yield GraphEdge(i, j, 1)
+    val ee = spark.createDataset(clique1 ++ clique2)
+    val g = GraphDataset(vv, ee)
+
+    if (isLaterVersion("4.1")) {
+      val salp = g.structureAwareLabelPropagation
+        .maxIter(5)
+        .setUseLocalCheckpoints(true)
+        .run()
+        .collect()
+        .map(r => r.id -> r.label)
+        .toMap
+      assert(Set(salp(1L), salp(2L), salp(3L)).size === 1)
+      assert(Set(salp(4L), salp(5L), salp(6L)).size === 1)
+      assert(salp(1L) !== salp(4L))
+
+      val attrProp = g.structureAwareLabelPropagation
+        .maxIter(5)
+        .setUseLocalCheckpoints(true)
+        .runWithInitialLabel(_.attr)
+        .collect()
+        .map(v => v.id -> v.attr)
+        .toMap
+      assert(attrProp(1L) === "c1")
+      assert(attrProp(4L) === "c2")
+    } else {
+      intercept[GraphFramesSparkVersionException] {
+        g.structureAwareLabelPropagation.maxIter(5).run()
+      }
+    }
+  }
+
+  test("randomWalksBasedEmbedding") {
+    val tmpDir = Files.createTempDirectory("gf-dataset-rw").toFile
+    try {
+      val vv = spark.createDataset((1L to 4L).map(i => GraphVertex(i, s"v$i")))
+      val ee = spark.createDataset(
+        Seq(
+          GraphEdge(1L, 2L, 1),
+          GraphEdge(2L, 3L, 1),
+          GraphEdge(3L, 4L, 1),
+          GraphEdge(4L, 1L, 1)))
+      val g = GraphDataset(vv, ee)
+
+      val rw = new RandomWalkWithRestart()
+        .setNumWalksPerNode(2)
+        .setBatchSize(4)
+        .setNumBatches(2)
+        .setRestartProbability(0.1)
+        .setTemporaryPrefix(tmpDir.getAbsolutePath)
+        .setGlobalSeed(42L)
+      val h2v = new Hash2Vec()
+        .setEmbeddingsDim(8)
+        .setContextSize(2)
+        .setNumPartitions(2)
+        .setDoNormalization(doNorm = true, safeNorm = false)
+
+      val emb = g.randomWalksBasedEmbedding
+        .setRandomWalks(rw)
+        .setSequenceModel(Right(h2v))
+        .setAggregateNeighbors(false)
+        .setCleanUpAfterRun(true)
+        .run()
+        .collect()
+
+      assert(emb.map(_.id).toSet === (1L to 4L).toSet)
+      emb.foreach(r => assert(r.embedding.size === 8))
+    } finally {
+      val _ = FileUtils.deleteQuietly(tmpDir)
+    }
   }
 }
