@@ -265,4 +265,28 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     assert(triplets.head.dstAttr === PersonAttr("Bob", 25))
     assert(triplets.head.attr === RelationAttr("friend", 0.9))
   }
+
+  test("toGraphX conversion") {
+    val g = GraphDataset(vertices, edges)
+    val gx = g.toGraphX
+    assert(gx.vertices.collect().toMap === localVertices)
+    val gxEdges = gx.edges.collect().map(e => (e.srcId, e.dstId) -> e.attr).toMap
+    assert(gxEdges === localEdges)
+  }
+
+  test("empty graph operations") {
+    import sqlImplicits.*
+    val emptyV = spark.emptyDataset[GraphVertex[String]]
+    val emptyE = spark.emptyDataset[GraphEdge[String]]
+    val g = GraphDataset(emptyV, emptyE)
+
+    g.validate()
+    assert(g.vertices.isEmpty)
+    assert(g.edges.isEmpty)
+    assert(g.triplets.isEmpty)
+    assert(g.degrees.isEmpty)
+    assert(g.inDegrees.isEmpty)
+    assert(g.outDegrees.isEmpty)
+    assert(g.dropIsolatedVertices().vertices.isEmpty)
+  }
 }

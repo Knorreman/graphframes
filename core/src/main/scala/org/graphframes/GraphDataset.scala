@@ -17,11 +17,14 @@
 
 package org.graphframes
 
+import org.apache.spark.graphframes.graphx.Edge
+import org.apache.spark.graphframes.graphx.Graph
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.array
 import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.functions.countDistinct
 import org.apache.spark.sql.functions.explode
 import org.apache.spark.storage.StorageLevel
@@ -33,6 +36,7 @@ import org.graphframes.lib.GraphVertex
 import org.graphframes.lib.PregelGraphDataset
 import org.graphframes.lib.VertexId
 
+import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
 /**
@@ -274,6 +278,17 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     GraphFrame(vDF, eDF)
   }
 
+  /**
+   * Converts this [[GraphDataset]] into a strongly typed GraphX `Graph[VD, ED]`.
+   *
+   * @group conversions
+   */
+  def toGraphX(implicit vdCt: ClassTag[VD], edCt: ClassTag[ED]): Graph[VD, ED] = {
+    val vRDD = vertices.rdd.map(v => (v.id, v.attr))
+    val eRDD = edges.rdd.map(e => Edge(e.srcId, e.dstId, e.attr))
+    Graph[VD, ED](vRDD, eRDD)
+  }
+
   // ============== Degree metrics ============
 
   /**
@@ -285,9 +300,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     val session = spark
     import session.implicits.*
     edges
-      .groupByKey((e: GraphEdge[ED]) => e.srcId)
-      .mapValues(_ => 1)
-      .reduceGroups(_ + _)
+      .groupBy(col("srcId"))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
   }
 
   /**
@@ -299,9 +314,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     val session = spark
     import session.implicits.*
     edges
-      .groupByKey((e: GraphEdge[ED]) => e.dstId)
-      .mapValues(_ => 1)
-      .reduceGroups(_ + _)
+      .groupBy(col("dstId"))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
   }
 
   /**
@@ -314,10 +329,10 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     val session = spark
     import session.implicits.*
     edges
-      .flatMap((e: GraphEdge[ED]) => Array(e.dstId, e.srcId))
-      .groupByKey((id: VertexId) => id)
-      .mapValues(_ => 1)
-      .reduceGroups(_ + _)
+      .select(explode(array(col("srcId"), col("dstId"))).alias("id"))
+      .groupBy(col("id"))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
   }
 
   // ============== Subgraph selection and transformations ============

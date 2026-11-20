@@ -199,4 +199,26 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
     val dists = result.vertices.collect().map(v => v.id -> v.attr).toMap
     assert(dists === Map(1L -> 0, 2L -> 5, 3L -> 12))
   }
+
+  test("empty edges applies initialMsg and restores job description") {
+    val vv = spark.createDataset(Seq(GraphVertex(1L, 10), GraphVertex(2L, 20)))
+    val ee = spark.emptyDataset[GraphEdge[Int]]
+    val g = GraphDataset(vv, ee)
+
+    sc.setJobDescription("caller-job")
+    val result = g.pregel
+      .setMaxIter(5)
+      .setCheckpointInterval(0)
+      .setJobDescriptionPrefix("CustomTypedPregel")
+      .withMessages[Int](5)
+      .vprog((_, attr, msg) => attr + msg)
+      .sendMsgToDst(_.srcAttr)
+      .mergeMsg(_ + _)
+      .run()
+
+    assert(sc.getLocalProperty("spark.job.description") === "caller-job")
+    assert(result.vertices.collect().map(v => v.id -> v.attr).toMap === Map(1L -> 15, 2L -> 25))
+    result.vertices.unpersist()
+    sc.setJobDescription(null)
+  }
 }

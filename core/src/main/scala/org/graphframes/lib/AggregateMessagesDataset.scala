@@ -23,6 +23,7 @@ import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.expressions.Aggregator
 import org.graphframes.GraphDataset
 import org.graphframes.Logging
+import org.graphframes.WithIntermediateStorageLevel
 
 import scala.collection.mutable.ListBuffer
 
@@ -53,6 +54,7 @@ class AggregateMessagesDataset[VD, ED, M: Encoder] private[graphframes] (
     private val graph: GraphDataset[VD, ED])
     extends Arguments
     with Logging
+    with WithIntermediateStorageLevel
     with Serializable {
 
   private val senders = ListBuffer.empty[GraphTriplet[VD, ED] => Iterator[(VertexId, M)]]
