@@ -152,18 +152,42 @@ val shortest = weightedGraph.pregel
   )
 ```
 
-## Connected Components
+## Standard Graph Algorithms
 
-`GraphDataset.connectedComponents` wraps `GraphFrame.connectedComponents` (supporting `two_phase`,
-`randomized_contraction`, and `graphx`) and returns a typed `Dataset[ConnectedComponentResult]`:
+`GraphDataset` wraps the standard `GraphFrame` topology algorithms with strongly typed results:
 
 ```scala
 import org.graphframes.lib.ConnectedComponents
 
+// Connected Components -> Dataset[ConnectedComponentResult]
 val cc = g.connectedComponents
   .setAlgorithm(ConnectedComponents.ALGO_TWO_PHASE)
   .setUseLocalCheckpoints(true)
   .run()
+
+// PageRank -> GraphDataset[PageRankAttr[VD], WeightedEdgeAttr[ED]]
+val pr = g.pageRank.resetProbability(0.15).maxIter(5).run()
+
+// Shortest Paths -> Dataset[ShortestPathsResult]
+val sp = g.shortestPaths.landmarks(Seq(1L, 3L)).run()
+
+// Triangle Count -> Dataset[TriangleCountResult]
+val tc = g.triangleCount.run()
+
+// Label Propagation -> Dataset[LabelPropagationResult]
+val lp = g.labelPropagation.maxIter(5).run()
+
+// Strongly Connected Components -> Dataset[ConnectedComponentResult]
+val scc = g.stronglyConnectedComponents.maxIter(5).run()
+
+// K-Core Decomposition -> Dataset[KCoreResult]
+val kc = g.kCore.setUseLocalCheckpoints(true).run()
+
+// Maximal Independent Set -> Dataset[GraphVertex[VD]]
+val mis = g.maximalIndependentSet.setUseLocalCheckpoints(true).run(seed = 42L)
+
+// Cycle Detection -> Dataset[Seq[VertexId]]
+val cycles = g.detectingCycles.setUseLocalCheckpoints(true).run()
 ```
 
 ## Saving and Loading

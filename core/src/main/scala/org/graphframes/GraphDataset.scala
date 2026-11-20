@@ -30,10 +30,18 @@ import org.apache.spark.sql.functions.explode
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.lib.AggregateMessagesDataset
 import org.graphframes.lib.ConnectedComponentsDataset
+import org.graphframes.lib.DetectingCyclesDataset
 import org.graphframes.lib.GraphEdge
 import org.graphframes.lib.GraphTriplet
 import org.graphframes.lib.GraphVertex
+import org.graphframes.lib.KCoreDataset
+import org.graphframes.lib.LabelPropagationDataset
+import org.graphframes.lib.MaximalIndependentSetDataset
+import org.graphframes.lib.PageRankDataset
 import org.graphframes.lib.PregelGraphDataset
+import org.graphframes.lib.ShortestPathsDataset
+import org.graphframes.lib.StronglyConnectedComponentsDataset
+import org.graphframes.lib.TriangleCountDataset
 import org.graphframes.lib.VertexId
 
 import scala.reflect.ClassTag
@@ -453,6 +461,86 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    */
   def pregel: PregelGraphDataset[VD, ED] =
     new PregelGraphDataset[VD, ED](this)
+
+  /**
+   * PageRank algorithm.
+   *
+   * See [[org.graphframes.lib.PageRankDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def pageRank: PageRankDataset[VD, ED] =
+    new PageRankDataset[VD, ED](this)
+
+  /**
+   * Shortest paths algorithm.
+   *
+   * See [[org.graphframes.lib.ShortestPathsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def shortestPaths: ShortestPathsDataset[VD, ED] =
+    new ShortestPathsDataset[VD, ED](this)
+
+  /**
+   * Triangle count algorithm.
+   *
+   * See [[org.graphframes.lib.TriangleCountDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def triangleCount: TriangleCountDataset[VD, ED] =
+    new TriangleCountDataset[VD, ED](this)
+
+  /**
+   * Label propagation algorithm.
+   *
+   * See [[org.graphframes.lib.LabelPropagationDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def labelPropagation: LabelPropagationDataset[VD, ED] =
+    new LabelPropagationDataset[VD, ED](this)
+
+  /**
+   * Strongly connected components algorithm.
+   *
+   * See [[org.graphframes.lib.StronglyConnectedComponentsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def stronglyConnectedComponents: StronglyConnectedComponentsDataset[VD, ED] =
+    new StronglyConnectedComponentsDataset[VD, ED](this)
+
+  /**
+   * K-Core decomposition algorithm.
+   *
+   * See [[org.graphframes.lib.KCoreDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def kCore: KCoreDataset[VD, ED] =
+    new KCoreDataset[VD, ED](this)
+
+  /**
+   * Maximal Independent Set algorithm.
+   *
+   * See [[org.graphframes.lib.MaximalIndependentSetDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def maximalIndependentSet: MaximalIndependentSetDataset[VD, ED] =
+    new MaximalIndependentSetDataset[VD, ED](this)
+
+  /**
+   * Cycle detection algorithm.
+   *
+   * See [[org.graphframes.lib.DetectingCyclesDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def detectingCycles: DetectingCyclesDataset[VD, ED] =
+    new DetectingCyclesDataset[VD, ED](this)
 }
 
 object GraphDataset extends Serializable with Logging {
