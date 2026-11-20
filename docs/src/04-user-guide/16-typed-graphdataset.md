@@ -201,6 +201,17 @@ val anf = g.hyperANF.setNHops(3).run()
 
 // Random-Walk Node Embeddings -> Dataset[NodeEmbeddingResult]
 val emb = g.randomWalksBasedEmbedding.setRandomWalks(rw).setSequenceModel(Right(h2v)).run()
+
+// SVD++ with typed edge rating extractor -> (Dataset[SVDPlusPlusResult], Double)
+val (svdVertices, loss) = g.svdPlusPlus.rank(8).maxIter(5).run(_.weight)
+
+// Power Iteration Clustering with optional typed weight extractor -> Dataset[ClusterAssignment]
+val clusters = g.powerIterationClustering(k = 2, maxIter = 20, weightExtractor = Some(_.weight))
+
+// Per-edge-type degree metrics -> Dataset[TypedDegreeResult[K]]
+val outByKind = g.typeOutDegree(_.kind)
+val inByKind = g.typeInDegree(_.kind, edgeTypes = Some(Seq("friend", "follow")))
+val degByKind = g.typeDegree(_.kind)
 ```
 
 ## Saving and Loading

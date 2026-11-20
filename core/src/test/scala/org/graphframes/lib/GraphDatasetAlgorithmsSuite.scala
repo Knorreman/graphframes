@@ -322,4 +322,100 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
       val _ = FileUtils.deleteQuietly(tmpDir)
     }
   }
+
+  test("svdPlusPlus with typed rating extractor and numeric overload") {
+    // Directed bipartite graph: users (1, 2) -> items (10, 11, 12)
+    val vv = spark.createDataset(
+      Seq(
+        GraphVertex(1L, "u1"),
+        GraphVertex(2L, "u2"),
+        GraphVertex(10L, "i1"),
+        GraphVertex(11L, "i2"),
+        GraphVertex(12L, "i3")))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 10L, RoadInfo("rate", 5)),
+        GraphEdge(1L, 11L, RoadInfo("rate", 3)),
+        GraphEdge(2L, 11L, RoadInfo("rate", 4)),
+        GraphEdge(2L, 12L, RoadInfo("rate", 2))))
+    val g = GraphDataset(vv, ee)
+
+    val svd = g.svdPlusPlus.rank(4).maxIter(2)
+    val (res, loss) = svd.run(_.lanes.toDouble)
+    val collected = res.collect()
+    assert(collected.map(_.id).toSet === Set(1L, 2L, 10L, 11L, 12L))
+    collected.foreach { r =>
+      assert(r.column1.size === 4)
+      assert(r.column2.size === 4)
+    }
+    assert(loss >= 0.0)
+    assert(svd.loss === loss)
+
+    // Numeric ED convenience overload
+    val numericGraph = g.mapEdges(_.attr.lanes.toDouble)
+    val (res2, loss2) = numericGraph.svdPlusPlus.rank(4).maxIter(2).run()
+    assert(res2.count() === 5L)
+    assert(loss2 >= 0.0)
+  }
+
+  test("powerIterationClustering with and without typed weight extractor") {
+    // Two strongly connected clusters (1-2-3) and (4-5-6) with a weak bridge (3-4)
+    val vv = spark.createDataset((1L to 6L).map(i => GraphVertex(i, s"v$i")))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, RoadInfo("strong", 10)),
+        GraphEdge(2L, 3L, RoadInfo("strong", 10)),
+        GraphEdge(1L, 3L, RoadInfo("strong", 10)),
+        GraphEdge(4L, 5L, RoadInfo("strong", 10)),
+        GraphEdge(5L, 6L, RoadInfo("strong", 10)),
+        GraphEdge(4L, 6L, RoadInfo("strong", 10)),
+        GraphEdge(3L, 4L, RoadInfo("weak", 1))))
+    val g = GraphDataset(vv, ee)
+
+    val weighted = g
+      .powerIterationClustering(k = 2, maxIter = 20, weightExtractor = Some(_.lanes.toDouble))
+      .collect()
+      .map(c => c.id -> c.cluster)
+      .toMap
+
+    assert(weighted.keySet === (1L to 6L).toSet)
+    assert(Set(weighted(1L), weighted(2L), weighted(3L)).size === 1)
+    assert(Set(weighted(4L), weighted(5L), weighted(6L)).size === 1)
+    assert(weighted(1L) !== weighted(4L))
+
+    val unweighted = g.powerIterationClustering(k = 2, maxIter = 10).collect()
+    assert(unweighted.map(_.id).toSet === (1L to 6L).toSet)
+  }
+
+  test("typeOutDegree, typeInDegree, and typeDegree with typed edge classifier") {
+    val vv = spark.createDataset((1L to 3L).map(i => GraphVertex(i, s"v$i")))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, RoadInfo("friend", 1)),
+        GraphEdge(1L, 3L, RoadInfo("follow", 1)),
+        GraphEdge(2L, 1L, RoadInfo("friend", 1)),
+        GraphEdge(2L, 3L, RoadInfo("friend", 1))))
+    val g = GraphDataset(vv, ee)
+
+    val outDeg = g.typeOutDegree(_.highway).collect().map(r => r.id -> r.degrees).toMap
+    assert(outDeg === Map(1L -> Map("friend" -> 1, "follow" -> 1), 2L -> Map("friend" -> 2)))
+
+    val inDegWithTypes = g
+      .typeInDegree(_.highway, edgeTypes = Some(Seq("friend", "follow", "block")))
+      .collect()
+      .map(r => r.id -> r.degrees)
+      .toMap
+    assert(
+      inDegWithTypes === Map(
+        1L -> Map("friend" -> 1, "follow" -> 0, "block" -> 0),
+        2L -> Map("friend" -> 1, "follow" -> 0, "block" -> 0),
+        3L -> Map("friend" -> 1, "follow" -> 1, "block" -> 0)))
+
+    val totalDeg = g.typeDegree(_.highway).collect().map(r => r.id -> r.degrees).toMap
+    assert(
+      totalDeg === Map(
+        1L -> Map("friend" -> 2, "follow" -> 1),
+        2L -> Map("friend" -> 3),
+        3L -> Map("friend" -> 1, "follow" -> 1)))
+  }
 }

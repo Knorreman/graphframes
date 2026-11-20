@@ -21,6 +21,7 @@ import org.apache.spark.graphframes.graphx.Edge
 import org.apache.spark.graphframes.graphx.Graph
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
+import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.array
 import org.apache.spark.sql.functions.col
@@ -29,6 +30,7 @@ import org.apache.spark.sql.functions.countDistinct
 import org.apache.spark.sql.functions.explode
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.lib.AggregateMessagesDataset
+import org.graphframes.lib.ClusterAssignment
 import org.graphframes.lib.ConnectedComponentsDataset
 import org.graphframes.lib.DetectingCyclesDataset
 import org.graphframes.lib.GraphEdge
@@ -42,10 +44,13 @@ import org.graphframes.lib.PageRankDataset
 import org.graphframes.lib.ParallelPersonalizedPageRankDataset
 import org.graphframes.lib.PregelGraphDataset
 import org.graphframes.lib.RandomWalkEmbeddingsDataset
+import org.graphframes.lib.SVDPlusPlusDataset
 import org.graphframes.lib.ShortestPathsDataset
 import org.graphframes.lib.StronglyConnectedComponentsDataset
 import org.graphframes.lib.StructureAwareLabelPropagationDataset
 import org.graphframes.lib.TriangleCountDataset
+import org.graphframes.lib.TypedDegreeMetrics
+import org.graphframes.lib.TypedDegreeResult
 import org.graphframes.lib.VertexId
 
 import scala.reflect.ClassTag
@@ -347,6 +352,61 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
       .as[(VertexId, Int)]
   }
 
+  /**
+   * The out-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
+   *
+   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
+   * includes all specified categories (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeOutDegree[K: Encoder: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    implicit val pairEncoder: Encoder[(VertexId, K)] =
+      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
+    val pairs = edges.map(e => (e.srcId, edgeType(e.attr)))
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
+  /**
+   * The in-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
+   *
+   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
+   * includes all specified categories (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeInDegree[K: Encoder: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    implicit val pairEncoder: Encoder[(VertexId, K)] =
+      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
+    val pairs = edges.map(e => (e.dstId, edgeType(e.attr)))
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
+  /**
+   * The total degree (in + out) of each vertex grouped by a typed edge category extracted via
+   * `edgeType`.
+   *
+   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
+   * includes all specified categories (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeDegree[K: Encoder: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    implicit val pairEncoder: Encoder[(VertexId, K)] =
+      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
+    val pairs = edges.flatMap { e =>
+      val k = edgeType(e.attr)
+      Seq((e.srcId, k), (e.dstId, k))
+    }
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
   // ============== Subgraph selection and transformations ============
 
   /**
@@ -585,6 +645,54 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    */
   def randomWalksBasedEmbedding: RandomWalkEmbeddingsDataset[VD, ED] =
     new RandomWalkEmbeddingsDataset[VD, ED](this)
+
+  /**
+   * SVD++ collaborative filtering algorithm.
+   *
+   * See [[org.graphframes.lib.SVDPlusPlusDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def svdPlusPlus: SVDPlusPlusDataset[VD, ED] =
+    new SVDPlusPlusDataset[VD, ED](this)
+
+  /**
+   * Power Iteration Clustering (PIC) algorithm.
+   *
+   * @param k
+   *   the number of clusters to create
+   * @param maxIter
+   *   maximum number of iterations
+   * @param weightExtractor
+   *   optional typed function extracting a non-negative similarity weight from each edge
+   *   attribute
+   * @return
+   *   a typed `Dataset[ClusterAssignment]` mapping each vertex ID to its assigned cluster
+   * @group stdlib
+   */
+  def powerIterationClustering(
+      k: Int,
+      maxIter: Int,
+      weightExtractor: Option[ED => Double] = None): Dataset[ClusterAssignment] = {
+    val session = spark
+    import session.implicits.*
+
+    val resDF = weightExtractor match {
+      case Some(extract) =>
+        val weightColName = "_gf_pic_weight"
+        val vDF = vertices.toDF(GraphFrame.ID, GraphFrame.ATTR)
+        val eDF = edges
+          .map(e => (e.srcId, e.dstId, extract(e.attr)))
+          .toDF(GraphFrame.SRC, GraphFrame.DST, weightColName)
+        GraphFrame(vDF, eDF).powerIterationClustering(k, maxIter, Some(weightColName))
+      case None =>
+        toGraphFrame.powerIterationClustering(k, maxIter, None)
+    }
+
+    resDF
+      .select(col(GraphFrame.ID).alias("id"), col("cluster").cast("int").alias("cluster"))
+      .as[ClusterAssignment]
+  }
 }
 
 object GraphDataset extends Serializable with Logging {
