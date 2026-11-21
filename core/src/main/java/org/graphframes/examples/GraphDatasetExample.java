@@ -21,8 +21,8 @@ import org.apache.spark.graphframes.graphx.EdgeDirection;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.SparkSession;
-import org.graphframes.JavaGraphDataset;
-import org.graphframes.lib.ConnectedComponentResult;
+import org.graphframes.dataset.JavaGraphDataset;
+import org.graphframes.dataset.lib.ConnectedComponentResult;
 import scala.Tuple2;
 import scala.Tuple3;
 
@@ -31,7 +31,7 @@ import java.util.Arrays;
 import java.util.Optional;
 
 /**
- * Example demonstrating the typed Java API ({@link JavaGraphDataset}) with JavaBean vertex/edge
+ * Example demonstrating the typed Java API ({@link org.graphframes.dataset.JavaGraphDataset}) with JavaBean vertex/edge
  * attributes, {@code aggregateMessages}, {@code pregel}, and {@code connectedComponents}.
  */
 public class GraphDatasetExample {

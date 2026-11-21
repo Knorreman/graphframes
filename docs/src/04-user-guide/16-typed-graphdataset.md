@@ -5,7 +5,7 @@
 attributes with Spark SQL's Catalyst optimizer and full interoperability with `GraphFrame`,
 GraphX, and Java (`JavaGraphDataset`).
 
-For full API details, refer to the @:scaladoc(org.graphframes.GraphDataset).
+For full API details, refer to the @:scaladoc(org.graphframes.dataset.GraphDataset).
 
 ## Creating a GraphDataset
 
@@ -14,8 +14,7 @@ Vertices are represented as `GraphVertex[VD](id: VertexId, attr: VD)` and edges 
 Attributes can be primitive types or custom Scala case classes:
 
 ```scala
-import org.graphframes.GraphDataset
-import org.graphframes.lib.{GraphEdge, GraphVertex}
+import org.graphframes.dataset.{GraphDataset, GraphEdge, GraphVertex}
 import spark.implicits._
 
 case class Person(name: String, age: Int)
@@ -51,8 +50,9 @@ val gFromEdges = GraphDataset.fromEdges(edges, defaultVertexAttribute = Person("
 val gf = g.toGraphFrame
 val g2 = GraphDataset.fromGraphFrame[Person, Relation](gf)
 
-// GraphDataset -> GraphX Graph[VD, ED]
+// GraphDataset <-> GraphX Graph[VD, ED]
 val gx = g.toGraphX
+val g3 = GraphDataset.fromGraphX[Person, Relation](gx)
 ```
 
 ## Basic Operations, Subgraphs, and Transformations
@@ -90,7 +90,7 @@ g.validate()
 `GraphDataset.aggregateMessages[M]` provides a compile-time type-safe message-passing primitive
 over `GraphTriplet[VD, ED]`.
 
-For API details, refer to the @:scaladoc(org.graphframes.lib.AggregateMessagesDataset).
+For API details, refer to the @:scaladoc(org.graphframes.dataset.lib.AggregateMessagesDataset).
 
 ```scala
 // Builder API with sendToSrc / sendToDst (and optional sendToSrcOpt / sendToDstOpt)
@@ -117,7 +117,7 @@ differs from the message type `M` (e.g., computing an average), or use the one-s
 `EdgeDirection` (`Out`, `In`, `Both`, `Either`), early termination when no messages remain, and
 both reliable and local checkpointing.
 
-For API details, refer to the @:scaladoc(org.graphframes.lib.PregelGraphDataset).
+For API details, refer to the @:scaladoc(org.graphframes.dataset.lib.PregelGraphDataset).
 
 ### Fluent Typed Builder
 
@@ -287,7 +287,7 @@ and Spark Java functional interfaces (`FilterFunction`, `MapFunction`, `Function
 import org.apache.spark.graphframes.graphx.EdgeDirection;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
-import org.graphframes.JavaGraphDataset;
+import org.graphframes.dataset.JavaGraphDataset;
 import scala.Tuple2;
 import scala.Tuple3;
 import java.util.Optional;

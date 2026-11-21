@@ -22,10 +22,10 @@ import org.apache.spark.graphframes.graphx.Graph
 import org.apache.spark.graphframes.graphx.Pregel as GraphXPregel
 import org.apache.spark.sql.functions.*
 import org.apache.spark.storage.StorageLevel
-import org.graphframes.GraphDataset
+import org.graphframes.dataset.GraphDataset
+import org.graphframes.dataset.GraphEdge
+import org.graphframes.dataset.GraphVertex
 import org.graphframes.lib.AggregateMessages
-import org.graphframes.lib.GraphEdge
-import org.graphframes.lib.GraphVertex
 import org.graphframes.lib.Pregel
 import org.openjdk.jmh.annotations.*
 import org.openjdk.jmh.infra.Blackhole
