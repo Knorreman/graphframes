@@ -266,7 +266,7 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
       spark.createDataset((1L to 4L).map(i => GraphVertex(i, if (i == 1L) 1 else 0))).cache()
     val ee = spark.createDataset((1L until 4L).map(i => GraphEdge(i, i + 1L, 1))).cache()
     val _ = (vv.count(), ee.count())
-    val beforeIds = sc.getPersistentRDDs.keySet
+    val beforeIds = sc.getPersistentRDDs.keySet.toSet
     val g = GraphDataset(vv, ee)
 
     try {
@@ -286,7 +286,7 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
 
       result.vertices.unpersist(blocking = true)
       assert(g.edges.storageLevel !== StorageLevel.NONE)
-      assert((sc.getPersistentRDDs.keySet -- beforeIds).isEmpty)
+      assert(sc.getPersistentRDDs.keySet.filterNot(beforeIds.contains).isEmpty)
     } finally {
       vv.unpersist(blocking = true)
       ee.unpersist(blocking = true)
@@ -377,9 +377,8 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
     }
 
     val prevDir = sc.getCheckpointDir
-    val prevConf = spark.conf.getOption("spark.checkpoint.dir")
+    assert(spark.conf.getOption("spark.checkpoint.dir").isEmpty)
     sc.setCheckpointDir(null)
-    spark.conf.unset("spark.checkpoint.dir")
     try {
       intercept[IOException] {
         val _ = g.pregel
@@ -392,7 +391,6 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
           .run()
       }
     } finally {
-      prevConf.foreach(spark.conf.set("spark.checkpoint.dir", _))
       prevDir.foreach(sc.setCheckpointDir)
     }
   }

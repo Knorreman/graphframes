@@ -469,10 +469,10 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
   }
 
   test("wrapped algorithms release raw caches and PageRank supports tol & sourceId") {
-    // Verify DatasetCacheUtils directly releases raw DataFrame cache while persisting typed output
+    // Non-identity projection releases raw DataFrame cache while persisting typed output
     val rawDF = spark
-      .createDataFrame(Seq((1L, 10L), (2L, 20L)))
-      .toDF("id", "label")
+      .createDataFrame(Seq((1L, 99, 10L), (2L, 99, 20L)))
+      .toDF("id", "extra", "label")
       .persist(StorageLevel.MEMORY_AND_DISK)
     assert(rawDF.count() === 2L)
     assert(rawDF.storageLevel !== StorageLevel.NONE)
@@ -485,6 +485,21 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
     cachedOut.unpersist(blocking = true)
     assert(cachedOut.storageLevel === StorageLevel.NONE)
 
+    // Identity projection (Spark 4.0 shares CacheManager entry) stays persistent until caller unpersists
+    val idDF = spark
+      .createDataFrame(Seq((1L, 10L), (2L, 20L)))
+      .toDF("id", "label")
+      .persist(StorageLevel.MEMORY_AND_DISK)
+    assert(idDF.count() === 2L)
+    val typedDS2 = idDF.select(col("id"), col("label")).as[LabelPropagationResult]
+    val cachedOut2 =
+      DatasetCacheUtils.materializeAndReleaseRaw(idDF, typedDS2, StorageLevel.MEMORY_AND_DISK)
+    assert(cachedOut2.storageLevel !== StorageLevel.NONE)
+    assert(cachedOut2.collect().map(r => r.id -> r.label).toMap === Map(1L -> 10L, 2L -> 20L))
+    cachedOut2.unpersist(blocking = true)
+    assert(cachedOut2.storageLevel === StorageLevel.NONE)
+    assert(idDF.storageLevel === StorageLevel.NONE)
+
     val vv = spark.createDataset((1L to 4L).map(i => GraphVertex(i, s"v$i"))).cache()
     val ee = spark
       .createDataset(Seq(GraphEdge(1L, 2L, 1), GraphEdge(2L, 3L, 1), GraphEdge(3L, 1L, 1)))
@@ -495,7 +510,7 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
 
     try {
       // Pure DataFrame algorithms should leave zero non-checkpointed persistent RDDs after blocking unpersist
-      var beforeIds = sc.getPersistentRDDs.keySet
+      var beforeIds = sc.getPersistentRDDs.keySet.toSet
       def assertNoLeaks(step: String): Unit = {
         val leaked = sc.getPersistentRDDs.filter { case (id, rdd) =>
           !beforeIds.contains(id) && !rdd.isCheckpointed
@@ -531,7 +546,7 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
       assert(mis.storageLevel !== StorageLevel.NONE)
       mis.unpersist(blocking = true)
       assert(mis.storageLevel === StorageLevel.NONE)
-      beforeIds = sc.getPersistentRDDs.keySet
+      beforeIds = sc.getPersistentRDDs.keySet.toSet
 
       val dc = g.detectingCycles.setUseLocalCheckpoints(false).run()
       assert(dc.storageLevel !== StorageLevel.NONE)

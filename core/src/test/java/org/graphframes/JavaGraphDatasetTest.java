@@ -581,9 +581,9 @@ public class JavaGraphDatasetTest {
 
       // Missing checkpoint dir throws UncheckedIOException in JavaPregel
       scala.Option<String> prevDir = spark.sparkContext().getCheckpointDir();
-      scala.Option<String> prevCkptConf = spark.conf().getOption("spark.checkpoint.dir");
+      assertEq(true, spark.conf().getOption("spark.checkpoint.dir").isEmpty(),
+          "spark.checkpoint.dir should be unset in test env");
       spark.sparkContext().setCheckpointDir(null);
-      spark.conf().unset("spark.checkpoint.dir");
       boolean caughtUnchecked = false;
       try {
         g.mapVertices((id, p) -> 0, Encoders.INT())
@@ -598,9 +598,6 @@ public class JavaGraphDatasetTest {
       } catch (UncheckedIOException expected) {
         caughtUnchecked = true;
       } finally {
-        if (prevCkptConf.isDefined()) {
-          spark.conf().set("spark.checkpoint.dir", prevCkptConf.get());
-        }
         if (prevDir.isDefined()) {
           spark.sparkContext().setCheckpointDir(prevDir.get());
         }

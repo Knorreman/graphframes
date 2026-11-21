@@ -60,20 +60,25 @@ private[graphframes] object DatasetCacheUtils {
       raw: DataFrame,
       typed: Dataset[T],
       storageLevel: StorageLevel): Dataset[T] = {
-    val persisted = typed.persist(storageLevel)
-    var succeeded = false
-    try {
-      val _ = persisted.count()
-      succeeded = true
-      persisted
-    } finally {
-      if (!succeeded) {
-        val _ = persisted.unpersist()
+    if (typed.storageLevel != StorageLevel.NONE) {
+      val _ = typed.count()
+      typed
+    } else {
+      val persisted = typed.persist(storageLevel)
+      var succeeded = false
+      try {
+        val _ = persisted.count()
+        succeeded = true
+        persisted
+      } finally {
+        if (!succeeded) {
+          val _ = persisted.unpersist()
+        }
+        if (raw.storageLevel != StorageLevel.NONE) {
+          val _ = raw.unpersist()
+        }
+        ()
       }
-      if (raw.storageLevel != StorageLevel.NONE) {
-        val _ = raw.unpersist()
-      }
-      ()
     }
   }
 
@@ -87,8 +92,12 @@ private[graphframes] object DatasetCacheUtils {
       typedVertices: Dataset[GraphVertex[VD]],
       typedEdges: Dataset[GraphEdge[ED]],
       storageLevel: StorageLevel): GraphDataset[VD, ED] = {
-    val persistedV = typedVertices.persist(storageLevel)
-    val persistedE = typedEdges.persist(storageLevel)
+    val verticesAlreadyCached = typedVertices.storageLevel != StorageLevel.NONE
+    val edgesAlreadyCached = typedEdges.storageLevel != StorageLevel.NONE
+    val persistedV =
+      if (verticesAlreadyCached) typedVertices else typedVertices.persist(storageLevel)
+    val persistedE =
+      if (edgesAlreadyCached) typedEdges else typedEdges.persist(storageLevel)
     var succeeded = false
     try {
       val _ = (persistedV.count(), persistedE.count())
@@ -96,12 +105,17 @@ private[graphframes] object DatasetCacheUtils {
       GraphDataset(persistedV, persistedE)
     } finally {
       if (!succeeded) {
-        val _ = (persistedV.unpersist(), persistedE.unpersist())
+        if (!verticesAlreadyCached) {
+          val _ = persistedV.unpersist()
+        }
+        if (!edgesAlreadyCached) {
+          val _ = persistedE.unpersist()
+        }
       }
-      if (rawGF.vertices.storageLevel != StorageLevel.NONE) {
+      if (!verticesAlreadyCached && rawGF.vertices.storageLevel != StorageLevel.NONE) {
         val _ = rawGF.vertices.unpersist()
       }
-      if (rawGF.edges.storageLevel != StorageLevel.NONE) {
+      if (!edgesAlreadyCached && rawGF.edges.storageLevel != StorageLevel.NONE) {
         val _ = rawGF.edges.unpersist()
       }
       ()

@@ -264,7 +264,7 @@ class GraphDatasetTraversalsSuite extends SparkFunSuite with GraphFrameTestSpark
     val cachedV = vv.cache()
     val cachedE = parallelE.cache()
     val _ = (cachedV.count(), cachedE.count())
-    val beforeIds = sc.getPersistentRDDs.keySet
+    val beforeIds = sc.getPersistentRDDs.keySet.toSet
     val cg = GraphDataset(cachedV, cachedE)
     try {
       val aggRes = cg.aggregateNeighbors
@@ -277,7 +277,7 @@ class GraphDatasetTraversalsSuite extends SparkFunSuite with GraphFrameTestSpark
       assert(aggRes.storageLevel !== StorageLevel.NONE)
       assert(aggRes.count() === 2L)
       aggRes.unpersist(blocking = true)
-      assert((sc.getPersistentRDDs.keySet -- beforeIds).isEmpty)
+      assert(sc.getPersistentRDDs.keySet.filterNot(beforeIds.contains).isEmpty)
     } finally {
       val _ = (cachedV.unpersist(blocking = true), cachedE.unpersist(blocking = true))
     }

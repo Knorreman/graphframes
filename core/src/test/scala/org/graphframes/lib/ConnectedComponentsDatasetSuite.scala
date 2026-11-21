@@ -132,7 +132,7 @@ class ConnectedComponentsDatasetSuite extends SparkFunSuite with GraphFrameTestS
       val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, 1), GraphEdge(3L, 4L, 1))).cache()
       assert(vv.count() === 4L)
       assert(ee.count() === 2L)
-      val beforeIds = sc.getPersistentRDDs.keySet
+      val beforeIds = sc.getPersistentRDDs.keySet.toSet
 
       val g = GraphDataset(vv, ee)
       val builder = g.connectedComponents

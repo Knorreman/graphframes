@@ -623,6 +623,10 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   private static <T> Dataset<T> materializeAndReleaseRaw(
       Dataset<Row> raw, Dataset<T> typed, StorageLevel storageLevel) {
+    if (!StorageLevel.NONE().equals(typed.storageLevel())) {
+      typed.count();
+      return typed;
+    }
     Dataset<T> persisted = typed.persist(storageLevel);
     boolean succeeded = false;
     try {
@@ -646,8 +650,12 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Encoder<VD> vdEncoder,
       Encoder<ED> edEncoder,
       StorageLevel storageLevel) {
-    Dataset<Tuple2<Long, VD>> persistedV = typedVertices.persist(storageLevel);
-    Dataset<Tuple3<Long, Long, ED>> persistedE = typedEdges.persist(storageLevel);
+    boolean verticesAlreadyCached = !StorageLevel.NONE().equals(typedVertices.storageLevel());
+    boolean edgesAlreadyCached = !StorageLevel.NONE().equals(typedEdges.storageLevel());
+    Dataset<Tuple2<Long, VD>> persistedV =
+        verticesAlreadyCached ? typedVertices : typedVertices.persist(storageLevel);
+    Dataset<Tuple3<Long, Long, ED>> persistedE =
+        edgesAlreadyCached ? typedEdges : typedEdges.persist(storageLevel);
     boolean succeeded = false;
     try {
       persistedV.count();
@@ -656,13 +664,17 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       return JavaGraphDataset.of(persistedV, persistedE, vdEncoder, edEncoder);
     } finally {
       if (!succeeded) {
-        persistedV.unpersist();
-        persistedE.unpersist();
+        if (!verticesAlreadyCached) {
+          persistedV.unpersist();
+        }
+        if (!edgesAlreadyCached) {
+          persistedE.unpersist();
+        }
       }
-      if (!StorageLevel.NONE().equals(rawGF.vertices().storageLevel())) {
+      if (!verticesAlreadyCached && !StorageLevel.NONE().equals(rawGF.vertices().storageLevel())) {
         rawGF.vertices().unpersist();
       }
-      if (!StorageLevel.NONE().equals(rawGF.edges().storageLevel())) {
+      if (!edgesAlreadyCached && !StorageLevel.NONE().equals(rawGF.edges().storageLevel())) {
         rawGF.edges().unpersist();
       }
     }
