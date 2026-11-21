@@ -259,3 +259,49 @@ val loaded = GraphDataset(
   spark.read.parquet("/path/to/edges").as[GraphEdge[Relation]]
 )
 ```
+
+## Java API (`JavaGraphDataset`)
+
+For Java applications, `JavaGraphDataset<VD, ED>` provides a native Java-friendly typed API that
+uses explicit Spark `Encoder`s (`Encoders.STRING()`, `Encoders.INT()`, `Encoders.bean(...)`, etc.)
+and Spark Java functional interfaces (`FilterFunction`, `MapFunction`, `Function2`, `Function3`,
+`ReduceFunction`, `Optional`) without requiring Scala `TypeTag`s or implicits:
+
+```java
+import org.apache.spark.graphframes.graphx.EdgeDirection;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoders;
+import org.graphframes.JavaGraphDataset;
+import scala.Tuple2;
+import scala.Tuple3;
+import java.util.Optional;
+
+JavaGraphDataset<Person, Relation> g = JavaGraphDataset.of(
+    verticesDs, // Dataset<Tuple2<Long, Person>>
+    edgesDs,    // Dataset<Tuple3<Long, Long, Relation>>
+    Encoders.bean(Person.class),
+    Encoders.bean(Relation.class));
+
+// Typed message aggregation
+Dataset<Tuple2<Long, Integer>> ageSum = g
+    .aggregateMessages(Encoders.INT())
+    .sendToDst(t -> t.srcAttr().getAge())
+    .agg(Integer::sum);
+
+// Typed Pregel
+JavaGraphDataset<Integer, Relation> maxAges = g
+    .mapVertices((id, p) -> p.getAge(), Encoders.INT())
+    .pregel()
+    .setMaxIter(5)
+    .setUseLocalCheckpoints(true)
+    .setActiveDirection(EdgeDirection.Out())
+    .withMessages(0, Encoders.INT())
+    .vprog((id, age, msg) -> Math.max(age, msg))
+    .sendMsgToDstOpt(t -> t.srcAttr() > t.dstAttr()
+        ? Optional.of(t.srcAttr())
+        : Optional.empty())
+    .mergeMsg(Math::max)
+    .run();
+```
+
+See `org.graphframes.examples.GraphDatasetExample` for a complete runnable Java example.
