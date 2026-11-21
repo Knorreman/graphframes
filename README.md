@@ -8,7 +8,7 @@
 
 # GraphFrames: graph algorithms at scale
 
-This is a package for graphs processing and analytics at scale. It is built on top of Apache Spark and relies on DataFrame abstraction. It provides built-in and easy to use distributed graph algorithms as well as flexible APIs like `Pregel`, `AggregateMessages` or `AggregateNeighbors` to make custom graph processing. Users can write highly expressive queries by leveraging the DataFrame API, combined with a new API for network motif finding. The user also benefits from DataFrame performance optimizations within the Spark SQL engine. GraphFrames works in Java, Scala, and Python.
+This is a package for graphs processing and analytics at scale. It is built on top of Apache Spark and relies on DataFrame abstraction. It provides built-in and easy to use distributed graph algorithms as well as flexible APIs like `Pregel`, `AggregateMessages` or `AggregateNeighbors` to make custom graph processing. Users can write highly expressive queries by leveraging the DataFrame API, combined with a new API for network motif finding. The user also benefits from DataFrame performance optimizations within the Spark SQL engine. For Scala and Java users who want compile-time type safety over vertex, edge, and message attributes, GraphFrames also provides a typed `GraphDataset` / `JavaGraphDataset` API built on Spark `Dataset` encoders. GraphFrames works in Java, Scala, and Python.
 
 ## GraphFrames usecases
 
@@ -38,6 +38,7 @@ There are some popular use cases when GraphFrames is almost irreplaceable, inclu
 - [Message Passing](https://graphframes.io/04-user-guide/09-aggregate-messages.html)
 - [Pregel](https://graphframes.io/04-user-guide/10-pregel.html)
 - [Labeled Property Graphs](https://graphframes.io/04-user-guide/11-property-graphs.html)
+- [Typed GraphDataset API (Scala & Java)](https://graphframes.io/04-user-guide/16-typed-graphdataset.html)
 - [Scala API](https://graphframes.io/api/scaladoc/)
 - [Python API](https://graphframes.io/api/python/)
 - [Apache Spark compatibility](https://graphframes.io/02-quick-start/01-installation.html#spark-versions-compatibility)
