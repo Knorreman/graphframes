@@ -175,7 +175,7 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
       .collect()
       .toSet
 
-    assert(cycles === Set(Seq(1L, 2L, 3L, 1L)))
+    assert(cycles === Set(SimplePath(Seq(1L, 2L, 3L, 1L), 3)))
   }
 
   test("parallelPersonalizedPageRank preserves custom case class VD and ED") {
@@ -223,7 +223,11 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
     val res = g.hyperANF.setNHops(2).setLgNomEntries(12).run()
     val collected = res.collect()
     assert(collected.map(_.id).toSet === (1L to 5L).toSet)
-    collected.foreach(r => assert(r.numHops === 2))
+    collected.foreach { r =>
+      assert(r.numHops === 2)
+      assert(r.attr === r.hopSketches)
+      assert(r.toVertex === GraphVertex(r.id, r.hopSketches))
+    }
 
     val estimates = res
       .select(
@@ -245,7 +249,7 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
 
     val filtered = g.hyperANF
       .setNHops(1)
-      .filterEdges(_.srcId == 1L)
+      .setEdgeFilter(_.srcId == 1L)
       .run()
       .collect()
     assert(filtered.map(_.id).toSet === Set(1L))
@@ -578,6 +582,9 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
 
     intercept[IllegalArgumentException] {
       val _ = g.randomWalksBasedEmbedding.run()
+    }
+    intercept[IllegalArgumentException] {
+      val _ = g.triangleCount.setAlgorithm("invalid")
     }
     assert(HyperANFResult(1L, Seq.empty).numHops === 0)
   }

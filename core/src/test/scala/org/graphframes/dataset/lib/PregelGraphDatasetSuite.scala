@@ -148,20 +148,19 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
       Seq(GraphEdge(1L, 2L, 2), GraphEdge(1L, 3L, 5), GraphEdge(2L, 3L, 1), GraphEdge(3L, 4L, 3)))
     val g = GraphDataset(vv, ee)
 
-    val result = PregelGraphDataset.run[Int, Int, PathMsg](
-      graph = g,
-      initialMsg = PathMsg(Int.MaxValue, -1L),
-      maxIterations = 10,
-      checkpointInterval = 2,
-      activeDirection = EdgeDirection.Out,
-      vprog = (_, dist, msg) => math.min(dist, msg.dist),
-      sendMsg = t =>
-        if (t.srcAttr != Int.MaxValue && t.srcAttr + t.attr < t.dstAttr) {
-          Iterator((t.dstId, PathMsg(t.srcAttr + t.attr, t.srcId)))
-        } else {
-          Iterator.empty
-        },
-      mergeMsg = (a, b) => if (a.dist <= b.dist) a else b)
+    val result = g.pregel
+      .setMaxIter(10)
+      .setCheckpointInterval(2)
+      .setActiveDirection(EdgeDirection.Out)
+      .run[PathMsg](initialMsg = PathMsg(Int.MaxValue, -1L))(
+        vprog = (_, dist, msg) => math.min(dist, msg.dist),
+        sendMsg = t =>
+          if (t.srcAttr != Int.MaxValue && t.srcAttr + t.attr < t.dstAttr) {
+            Iterator((t.dstId, PathMsg(t.srcAttr + t.attr, t.srcId)))
+          } else {
+            Iterator.empty
+          },
+        mergeMsg = (a, b) => if (a.dist <= b.dist) a else b)
 
     val dists = result.vertices.collect().map(v => v.id -> v.attr).toMap
     assert(dists === Map(1L -> 0, 2L -> 2, 3L -> 3, 4L -> 6, 5L -> Int.MaxValue))

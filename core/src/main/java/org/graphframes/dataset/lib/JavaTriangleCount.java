@@ -47,7 +47,12 @@ public final class JavaTriangleCount implements Serializable {
   }
 
   public JavaTriangleCount setAlgorithm(String value) {
-    this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
+    Objects.requireNonNull(value, "algorithm must not be null");
+    if (!"exact".equals(value) && !"approx".equals(value)) {
+      throw new IllegalArgumentException(
+          "supported algorithms: exact, approx, but got: " + value);
+    }
+    this.algorithm = value;
     return this;
   }
 

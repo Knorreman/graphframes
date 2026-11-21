@@ -32,6 +32,8 @@ import org.apache.spark.sql.functions;
 import org.apache.spark.storage.StorageLevel;
 import org.graphframes.dataset.GraphTriplet;
 import org.graphframes.dataset.JavaGraphDataset;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import scala.Tuple2;
 import scala.Tuple3;
 import scala.Tuple5;
@@ -54,6 +56,7 @@ import java.util.Optional;
  */
 public final class JavaPregel<VD, ED> implements Serializable {
 
+  private static final Logger LOG = LoggerFactory.getLogger(JavaPregel.class);
   private static final String JOB_DESCRIPTION_KEY = "spark.job.description";
   private static final String SRC_ID_COL = "srcId";
   private static final String DST_ID_COL = "dstId";
@@ -312,9 +315,13 @@ public final class JavaPregel<VD, ED> implements Serializable {
             .persist(storageLevel);
 
         boolean hasMessages = messages.count() > 0;
+        if (!hasMessages) {
+          LOG.info("there are no initial messages; JavaPregel stops before iteration 1");
+        }
         int iteration = 0;
 
         while (hasMessages && iteration < maxIterations) {
+          LOG.info("start JavaPregel iteration {}{}", iteration + 1, maxIterSuffix);
           spark.sparkContext().setJobDescription(
               jobDescriptionPrefix + ": iteration " + (iteration + 1) + maxIterSuffix);
           prevVertices = currentVertices;
@@ -354,6 +361,11 @@ public final class JavaPregel<VD, ED> implements Serializable {
                 msgEncoder)
                 .persist(storageLevel);
             hasMessages = messages.count() > 0;
+            if (!hasMessages) {
+              LOG.info(
+                  "there are no more messages; JavaPregel stops earlier at iteration {}",
+                  iteration + 1);
+            }
           } else {
             if (!didLocalCkpt) {
               currentVertices.count();

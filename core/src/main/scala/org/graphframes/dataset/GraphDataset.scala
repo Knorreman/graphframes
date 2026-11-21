@@ -34,6 +34,7 @@ import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.types.ShortType
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphFrame
+import org.graphframes.GraphFramesUnsupportedVertexTypeException
 import org.graphframes.InvalidGraphException
 import org.graphframes.Logging
 import org.graphframes.dataset.lib.AggregateMessagesDataset
@@ -809,24 +810,30 @@ object GraphDataset extends Serializable with Logging {
    * The vertices DataFrame must contain an integral `id` column (`Byte`, `Short`, `Int`, or
    * `Long`) and an `attr` column; the edges DataFrame must contain integral `src` and `dst`
    * columns and an `attr` column.
+   *
+   * @throws org.graphframes.GraphFramesUnsupportedVertexTypeException
+   *   if vertex IDs or edge endpoints are not an integral SQL type
    */
   def fromGraphFrame[VD: TypeTag, ED: TypeTag](graph: GraphFrame): GraphDataset[VD, ED] = {
     require(graph != null, "graph must not be null.")
     val idType = graph.vertices.schema(GraphFrame.ID).dataType
-    require(
-      isIntegralType(idType),
-      s"GraphDataset vertex ID column '${GraphFrame.ID}' must be an integral type " +
-        s"(Byte, Short, Int, Long), but found $idType.")
+    if (!isIntegralType(idType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset vertex ID column '${GraphFrame.ID}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $idType.")
+    }
     val srcType = graph.edges.schema(GraphFrame.SRC).dataType
-    require(
-      isIntegralType(srcType),
-      s"GraphDataset edge column '${GraphFrame.SRC}' must be an integral type " +
-        s"(Byte, Short, Int, Long), but found $srcType.")
+    if (!isIntegralType(srcType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset edge column '${GraphFrame.SRC}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $srcType.")
+    }
     val dstType = graph.edges.schema(GraphFrame.DST).dataType
-    require(
-      isIntegralType(dstType),
-      s"GraphDataset edge column '${GraphFrame.DST}' must be an integral type " +
-        s"(Byte, Short, Int, Long), but found $dstType.")
+    if (!isIntegralType(dstType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset edge column '${GraphFrame.DST}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $dstType.")
+    }
     require(
       graph.vertices.columns.contains(GraphFrame.ATTR),
       s"Vertex attribute column '${GraphFrame.ATTR}' is missing from GraphFrame.vertices " +

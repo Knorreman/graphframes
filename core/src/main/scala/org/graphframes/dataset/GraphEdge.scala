@@ -46,10 +46,7 @@ trait GraphEdgeBase[ED] {
  * @tparam ED
  *   the edge attribute type
  */
-case class GraphEdge[ED](
-    srcId: VertexId = 0L,
-    dstId: VertexId = 0L,
-    attr: ED = null.asInstanceOf[ED])
+case class GraphEdge[ED](srcId: VertexId, dstId: VertexId, attr: ED)
     extends Serializable
     with GraphEdgeBase[ED]
 

@@ -56,9 +56,13 @@ class TriangleCountDataset[VD, ED] private[dataset] (private val graph: GraphDat
     with WithLgNomEntries {
 
   private var algorithm: String = "exact"
+  private val supportedAlgorithms: Set[String] = Set("exact", "approx")
 
   /** Sets the triangle counting algorithm: `"exact"` (default) or `"approx"`. */
   def setAlgorithm(value: String): this.type = {
+    require(
+      value != null && supportedAlgorithms.contains(value),
+      s"supported algorithms: ${supportedAlgorithms.mkString(", ")}")
     algorithm = value
     this
   }

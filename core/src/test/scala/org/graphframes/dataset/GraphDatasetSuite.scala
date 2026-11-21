@@ -25,6 +25,7 @@ import org.apache.spark.sql.Dataset
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphFrame
 import org.graphframes.GraphFrameTestSparkContext
+import org.graphframes.GraphFramesUnsupportedVertexTypeException
 import org.graphframes.InvalidGraphException
 import org.graphframes.SparkFunSuite
 
@@ -152,6 +153,12 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     assert(t.vertexAttr(2L) === "B")
     assert(t.otherVertexAttr(1L) === "B")
     assert(t.otherVertexAttr(2L) === "A")
+    intercept[IllegalArgumentException] {
+      val _ = t.vertexAttr(999L)
+    }
+    intercept[IllegalArgumentException] {
+      val _ = t.otherVertexAttr(999L)
+    }
     val expectedTuple = ((1L, "A"), (2L, "B"), "love")
     assert(t.toTuple === expectedTuple)
     val et = t.toEdgeTriplet
@@ -366,12 +373,12 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     val validEdges = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "attr")
 
     val strV = spark.createDataFrame(Seq(("1", "A"))).toDF("id", "attr")
-    intercept[IllegalArgumentException] {
+    intercept[GraphFramesUnsupportedVertexTypeException] {
       val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(strV, validEdges))
     }
 
     val dblE = spark.createDataFrame(Seq((1.0, 2.0, "know"))).toDF("src", "dst", "attr")
-    intercept[IllegalArgumentException] {
+    intercept[GraphFramesUnsupportedVertexTypeException] {
       val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validVertices, dblE))
     }
 

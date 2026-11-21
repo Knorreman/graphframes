@@ -122,6 +122,18 @@ class ConnectedComponentsDatasetSuite extends SparkFunSuite with GraphFrameTestS
     assert(cc === Map(1L -> 1L, 2L -> 2L))
   }
 
+  test("setAlgorithm validates eagerly and normalizes deprecated alias") {
+    import sqlImplicits.*
+    val g = GraphDataset(
+      spark.createDataset(Seq(GraphVertex(1L, "a"))),
+      spark.emptyDataset[GraphEdge[String]])
+    intercept[IllegalArgumentException] {
+      val _ = g.connectedComponents.setAlgorithm("invalid")
+    }
+    val cc = g.connectedComponents.setAlgorithm(ConnectedComponents.ALGO_GRAPHFRAMES)
+    assert(cc.getAlgorithm === ConnectedComponents.ALGO_TWO_PHASE)
+  }
+
   test("respects GraphFramesConf settings and releases raw DF cache on unpersist") {
     val algoKey = "spark.graphframes.connectedComponents.algorithm"
     val localCkptKey = "spark.graphframes.useLocalCheckpoints"

@@ -213,6 +213,9 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
     require(
       stoppingCond.isDefined || targetCond.isDefined,
       "At least one of setStoppingCondition or setTargetCondition must be set.")
+    if (maxHops > 10) {
+      logWarn(s"maxHops is very large ($maxHops). This might be performance-intensive.")
+    }
 
     val spark = graph.spark
     if (checkpointInterval > 0 && !useLocalCheckpoints && spark.sparkContext.getCheckpointDir.isEmpty) {
@@ -317,15 +320,15 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
         states = maybeCkptStates.persist(intermediateStorageLevel)
         finished = maybeCkptFinished.persist(intermediateStorageLevel)
 
-        converged = {
-          val _ = finished.count()
-          states.count() == 0
-        }
+        val collected = finished.count()
+        converged = states.count() == 0
 
         val _ = (transitions.unpersist(), prevStates.unpersist(), prevFinished.unpersist())
         transitions = null
         prevStates = null
         prevFinished = null
+
+        logInfo(s"iteration $iter, collected $collected rows")
       }
 
       if (iter == 0) {

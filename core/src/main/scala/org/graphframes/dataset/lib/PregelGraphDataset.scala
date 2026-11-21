@@ -141,6 +141,10 @@ class PregelGraphDataset[VD: TypeTag, ED: TypeTag] private[dataset] (
 
   /**
    * Executes the Pregel computation using GraphX `EdgeTriplet` in `sendMsg`.
+   *
+   * The returned graph has a persisted and materialized `vertices` dataset and reuses
+   * `graph.edges`; callers should call `result.vertices.unpersist()` (rather than
+   * `result.unpersist()`) when finished so caller-cached input edges remain cached.
    */
   def run[A: Encoder](initialMsg: A)(
       vprog: (VertexId, VD, A) => VD,
@@ -162,6 +166,10 @@ class PregelGraphDataset[VD: TypeTag, ED: TypeTag] private[dataset] (
 
   /**
    * Executes the Pregel computation using typed [[GraphTriplet]] in `sendMsg`.
+   *
+   * The returned graph has a persisted and materialized `vertices` dataset and reuses
+   * `graph.edges`; callers should call `result.vertices.unpersist()` (rather than
+   * `result.unpersist()`) when finished so caller-cached input edges remain cached.
    */
   def runTriplets[A: Encoder](initialMsg: A)(
       vprog: (VertexId, VD, A) => VD,
@@ -243,7 +251,13 @@ class TypedPregelBuilder[VD: TypeTag, ED: TypeTag, A: Encoder] private[lib] (
     this
   }
 
-  /** Executes the configured Pregel computation. */
+  /**
+   * Executes the configured Pregel computation.
+   *
+   * The returned graph has a persisted and materialized `vertices` dataset and reuses
+   * `graph.edges`; callers should call `result.vertices.unpersist()` (rather than
+   * `result.unpersist()`) when finished so caller-cached input edges remain cached.
+   */
   def run(): GraphDataset[VD, ED] = {
     val vp = vertexProgram.getOrElse(
       throw new IllegalArgumentException("vprog must be set before calling run()."))
@@ -269,7 +283,7 @@ class TypedPregelBuilder[VD: TypeTag, ED: TypeTag, A: Encoder] private[lib] (
   }
 }
 
-object PregelGraphDataset extends Logging {
+private[lib] object PregelGraphDataset extends Logging {
 
   private val ID_COL = "id"
   private val ATTR_COL = "attr"
@@ -444,9 +458,13 @@ object PregelGraphDataset extends Logging {
           .persist(intermediateStorageLevel)
 
         var hasMessages = messages.count() > 0
+        if (!hasMessages) {
+          logInfo("there are no initial messages; Pregel stops before iteration 1")
+        }
         var iteration = 0
 
         while (hasMessages && iteration < maxIterations) {
+          logInfo(s"start Pregel iteration ${iteration + 1}$maxIterSuffix")
           spark.sparkContext.setJobDescription(
             s"$jobDescriptionPrefix: iteration ${iteration + 1}$maxIterSuffix")
           prevVertices = currentVertices
@@ -478,6 +496,10 @@ object PregelGraphDataset extends Logging {
               buildActiveTriplets(currentVertices, cachedEdgesDF, filterActive = true))
               .persist(intermediateStorageLevel)
             hasMessages = messages.count() > 0
+            if (!hasMessages) {
+              logInfo(
+                s"there are no more messages; Pregel stops earlier at iteration ${iteration + 1}")
+            }
           } else {
             if (!didLocalCkpt) {
               val _ = currentVertices.count()

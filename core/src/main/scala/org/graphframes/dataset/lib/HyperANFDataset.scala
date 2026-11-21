@@ -29,6 +29,8 @@ import org.graphframes.WithIntermediateStorageLevel
 import org.graphframes.WithLocalCheckpoints
 import org.graphframes.dataset.GraphDataset
 import org.graphframes.dataset.GraphEdge
+import org.graphframes.dataset.GraphVertex
+import org.graphframes.dataset.GraphVertexBase
 import org.graphframes.dataset.VertexId
 
 /**
@@ -38,7 +40,11 @@ import org.graphframes.dataset.VertexId
  * `hopSketches(k)` stores the compact HyperLogLog sketch bytes for vertices reachable in exactly
  * `k` directed hops from `id`.
  */
-case class HyperANFResult(id: VertexId, hopSketches: Seq[Array[Byte]]) extends Serializable {
+case class HyperANFResult(id: VertexId, hopSketches: Seq[Array[Byte]])
+    extends Serializable
+    with GraphVertexBase[Seq[Array[Byte]]] {
+  def attr: Seq[Array[Byte]] = hopSketches
+  def toVertex: GraphVertex[Seq[Array[Byte]]] = GraphVertex(id, hopSketches)
   def numHops: Int = math.max(0, hopSketches.size - 1)
 }
 
@@ -82,7 +88,7 @@ class HyperANFDataset[VD, ED] private[dataset] (private val graph: GraphDataset[
   }
 
   /** Restricts the HyperANF expansion to edges matching the given typed predicate. */
-  def filterEdges(predicate: GraphEdge[ED] => Boolean): this.type = {
+  def setEdgeFilter(predicate: GraphEdge[ED] => Boolean): this.type = {
     edgePredicate = Some(predicate)
     this
   }

@@ -19,13 +19,18 @@ package org.graphframes.dataset.lib
 
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.size
 import org.graphframes.Logging
 import org.graphframes.WithCheckpointInterval
 import org.graphframes.WithIntermediateStorageLevel
 import org.graphframes.WithLocalCheckpoints
 import org.graphframes.dataset.GraphDataset
-import org.graphframes.dataset.VertexId
 import org.graphframes.lib.DetectingCycles
+
+private object DetectingCyclesDatasetCols {
+  val PATH_COL = "path"
+  val LENGTH_COL = "length"
+}
 
 /**
  * Cycle detection algorithm for [[org.graphframes.dataset.GraphDataset]], wrapping
@@ -40,20 +45,21 @@ class DetectingCyclesDataset[VD, ED] private[dataset] (private val graph: GraphD
     with WithCheckpointInterval {
 
   /**
-   * Runs cycle detection and returns a persisted and materialized `Dataset[Seq[VertexId]]` of
-   * unique cycles. Callers should call `.unpersist()` when finished.
+   * Runs cycle detection and returns a persisted and materialized `Dataset[SimplePath]` of unique
+   * cycles. Callers should call `.unpersist()` when finished.
    */
-  def run(): Dataset[Seq[VertexId]] = {
-    val session = graph.spark
-    import session.implicits.*
+  def run(): Dataset[SimplePath] = {
+    import DetectingCyclesDatasetCols.*
     val rawDF = graph.toGraphFrame.detectingCycles
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .setCheckpointInterval(checkpointInterval)
       .run()
     val typed = rawDF
-      .select(col(DetectingCycles.foundSeqCol))
-      .as[Seq[VertexId]]
+      .select(
+        col(DetectingCycles.foundSeqCol).alias(PATH_COL),
+        (size(col(DetectingCycles.foundSeqCol)) - 1).alias(LENGTH_COL))
+      .as[SimplePath]
     val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
     resultIsPersistent()
     res

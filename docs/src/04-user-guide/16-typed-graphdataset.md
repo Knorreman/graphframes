@@ -221,7 +221,7 @@ val kc = g.kCore.setUseLocalCheckpoints(true).run()
 // Maximal Independent Set -> Dataset[GraphVertex[VD]]
 val mis = g.maximalIndependentSet.setUseLocalCheckpoints(true).run(seed = 42L)
 
-// Cycle Detection -> Dataset[Seq[VertexId]]
+// Cycle Detection -> Dataset[SimplePath]
 val cycles = g.detectingCycles.setUseLocalCheckpoints(true).run()
 
 // Parallel Personalized PageRank -> GraphDataset[PersonalizedPageRankAttr[VD], WeightedEdgeAttr[ED]]
@@ -323,6 +323,24 @@ JavaGraphDataset<Integer, Relation> maxAges = g
 maxAges.vertices().show();
 maxAges.vertices().unpersist();
 ```
+
+### Scala vs. Java API Differences
+
+- **Dataset element types**: `GraphDataset` exposes `Dataset[GraphVertex[VD]]`,
+  `Dataset[GraphEdge[ED]]`, and `Dataset[GraphTriplet[VD, ED]]`, whereas `JavaGraphDataset`
+  exposes `Dataset<Tuple2<Long, VD>>`, `Dataset<Tuple3<Long, Long, ED>>`, and
+  `Dataset<Tuple5<Long, Long, VD, VD, ED>>` while still passing `GraphVertex`, `GraphEdge`, and
+  `GraphTriplet` instances into Java predicates/mappers.
+- **`bfs`**: Scala `GraphDataset.bfs` returns `Dataset[GraphPath[VD, ED]]` (preserving full typed
+  vertices and edges), whereas Java `JavaGraphDataset.bfs` returns `Dataset<SimplePath>` (ordered
+  vertex IDs and hop length).
+- **`typeOutDegree` / `typeInDegree` / `typeDegree`**: Both Scala and Java support an optional
+  `edgeTypes` filter; Scala returns `Dataset[TypedDegreeResult[K]]` with a zero-filled `Map` over
+  requested `edgeTypes`, whereas Java returns sparse `Dataset<Tuple3<Long, K, Integer>>` rows for
+  matching non-null categories.
+- **`fromGraphFrame` error type**: Non-integral ID/src/dst columns throw
+  `GraphFramesUnsupportedVertexTypeException` in Scala `GraphDataset.fromGraphFrame` and unchecked
+  `IllegalArgumentException` in `JavaGraphDataset.fromGraphFrame`.
 
 Result helper methods such as `SimplePath.pathAsJava()`, `ShortestPathsResult.distancesAsJava()`,
 and `SVDPlusPlusResult.column1AsJava()` / `column2AsJava()` expose unmodifiable Java `List`/`Map`

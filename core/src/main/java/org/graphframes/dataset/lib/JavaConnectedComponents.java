@@ -24,8 +24,11 @@ import org.apache.spark.storage.StorageLevel;
 import org.graphframes.GraphFrame;
 import org.graphframes.dataset.JavaGraphDataset;
 import org.graphframes.lib.ConnectedComponents;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -34,6 +37,8 @@ import java.util.Objects;
  * {@code spark.graphframes.*} defaults.
  */
 public final class JavaConnectedComponents implements Serializable {
+
+  private static final Logger LOG = LoggerFactory.getLogger(JavaConnectedComponents.class);
 
   private static final String ID_COL = "id";
   private static final String COMPONENT_COL = "component";
@@ -52,7 +57,27 @@ public final class JavaConnectedComponents implements Serializable {
   }
 
   public JavaConnectedComponents setAlgorithm(String value) {
-    this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
+    Objects.requireNonNull(value, "algorithm must not be null");
+    String normalized = value.toLowerCase(Locale.ROOT);
+    if (ConnectedComponents.ALGO_GRAPHX().equals(normalized)
+        || ConnectedComponents.ALGO_TWO_PHASE().equals(normalized)
+        || ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION().equals(normalized)) {
+      this.algorithm = normalized;
+    } else if (ConnectedComponents.ALGO_GRAPHFRAMES().equals(normalized)) {
+      LOG.warn(
+          "Algorithm '{}' is deprecated and will be removed in a future release. "
+              + "Using '{}' instead.",
+          ConnectedComponents.ALGO_GRAPHFRAMES(),
+          ConnectedComponents.ALGO_TWO_PHASE());
+      this.algorithm = ConnectedComponents.ALGO_TWO_PHASE();
+    } else {
+      throw new IllegalArgumentException(
+          "Unsupported algorithm: '" + value + "'. Supported values are: "
+              + ConnectedComponents.ALGO_GRAPHX() + ", "
+              + ConnectedComponents.ALGO_TWO_PHASE() + ", "
+              + ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION() + ", "
+              + ConnectedComponents.ALGO_GRAPHFRAMES() + " (deprecated).");
+    }
     return this;
   }
 

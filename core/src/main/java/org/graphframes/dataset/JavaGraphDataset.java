@@ -52,6 +52,7 @@ import scala.Tuple5;
 
 import java.io.Serializable;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -396,6 +397,26 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   }
 
   /**
+   * Computes per-edge-type out-degrees restricted to categories in {@code edgeTypes}.
+   *
+   * <p>{@code null} entries in {@code edgeTypes} and edges whose category is {@code null} or not
+   * in {@code edgeTypes} are ignored. Unlike Scala {@code GraphDataset.typeOutDegree}, returns
+   * sparse {@code (vertexId, edgeType, count)} rows (without zero-filled entries for absent edge
+   * types).
+   */
+  public <K> Dataset<Tuple3<Long, K, Integer>> typeOutDegree(
+      MapFunction<ED, K> edgeTypeExtractor, List<K> edgeTypes, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(edgeTypes, "edgeTypes must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
+    Dataset<Tuple2<Long, K>> pairs = edges().map(
+        (MapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>)
+            e -> new Tuple2<>(e._1(), edgeTypeExtractor.call(e._3())),
+        Encoders.tuple(Encoders.LONG(), keyEncoder));
+    return countByKey(pairs, edgeTypes, keyEncoder);
+  }
+
+  /**
    * Computes per-edge-type in-degrees as {@code Dataset<Tuple3<Long, K, Integer>>}
    * {@code (vertexId, edgeType, count)}. {@code null} edge categories are ignored.
    */
@@ -408,6 +429,26 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
             e -> new Tuple2<>(e._2(), edgeTypeExtractor.call(e._3())),
         Encoders.tuple(Encoders.LONG(), keyEncoder));
     return countByKey(pairs, keyEncoder);
+  }
+
+  /**
+   * Computes per-edge-type in-degrees restricted to categories in {@code edgeTypes}.
+   *
+   * <p>{@code null} entries in {@code edgeTypes} and edges whose category is {@code null} or not
+   * in {@code edgeTypes} are ignored. Unlike Scala {@code GraphDataset.typeInDegree}, returns
+   * sparse {@code (vertexId, edgeType, count)} rows (without zero-filled entries for absent edge
+   * types).
+   */
+  public <K> Dataset<Tuple3<Long, K, Integer>> typeInDegree(
+      MapFunction<ED, K> edgeTypeExtractor, List<K> edgeTypes, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(edgeTypes, "edgeTypes must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
+    Dataset<Tuple2<Long, K>> pairs = edges().map(
+        (MapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>)
+            e -> new Tuple2<>(e._2(), edgeTypeExtractor.call(e._3())),
+        Encoders.tuple(Encoders.LONG(), keyEncoder));
+    return countByKey(pairs, edgeTypes, keyEncoder);
   }
 
   /**
@@ -425,6 +466,43 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
         },
         Encoders.tuple(Encoders.LONG(), keyEncoder));
     return countByKey(pairs, keyEncoder);
+  }
+
+  /**
+   * Computes per-edge-type total degrees restricted to categories in {@code edgeTypes}.
+   *
+   * <p>{@code null} entries in {@code edgeTypes} and edges whose category is {@code null} or not
+   * in {@code edgeTypes} are ignored. Unlike Scala {@code GraphDataset.typeDegree}, returns sparse
+   * {@code (vertexId, edgeType, count)} rows (without zero-filled entries for absent edge types).
+   */
+  public <K> Dataset<Tuple3<Long, K, Integer>> typeDegree(
+      MapFunction<ED, K> edgeTypeExtractor, List<K> edgeTypes, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(edgeTypes, "edgeTypes must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
+    Dataset<Tuple2<Long, K>> pairs = edges().flatMap(
+        (FlatMapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>) e -> {
+          K k = edgeTypeExtractor.call(e._3());
+          return Arrays.asList(new Tuple2<>(e._1(), k), new Tuple2<>(e._2(), k)).iterator();
+        },
+        Encoders.tuple(Encoders.LONG(), keyEncoder));
+    return countByKey(pairs, edgeTypes, keyEncoder);
+  }
+
+  private <K> Dataset<Tuple3<Long, K, Integer>> countByKey(
+      Dataset<Tuple2<Long, K>> pairs, List<K> edgeTypes, Encoder<K> keyEncoder) {
+    HashSet<K> allowed = new HashSet<>();
+    for (K k : edgeTypes) {
+      if (k != null) {
+        allowed.add(k);
+      }
+    }
+    if (allowed.isEmpty()) {
+      return spark().emptyDataset(Encoders.tuple(Encoders.LONG(), keyEncoder, Encoders.INT()));
+    }
+    Dataset<Tuple2<Long, K>> filtered = pairs.filter(
+        (FilterFunction<Tuple2<Long, K>>) p -> p._2() != null && allowed.contains(p._2()));
+    return countByKey(filtered, keyEncoder);
   }
 
   private <K> Dataset<Tuple3<Long, K, Integer>> countByKey(

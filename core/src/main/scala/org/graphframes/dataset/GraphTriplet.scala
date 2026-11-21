@@ -66,7 +66,9 @@ case class GraphTriplet[VD, ED](
   def otherVertexAttr(vid: VertexId): VD =
     if (srcId == vid) dstAttr
     else {
-      assert(dstId == vid)
+      require(
+        dstId == vid,
+        s"Vertex $vid is neither srcId ($srcId) nor dstId ($dstId) of this triplet.")
       srcAttr
     }
 
@@ -76,7 +78,9 @@ case class GraphTriplet[VD, ED](
   def vertexAttr(vid: VertexId): VD =
     if (srcId == vid) srcAttr
     else {
-      assert(dstId == vid)
+      require(
+        dstId == vid,
+        s"Vertex $vid is neither srcId ($srcId) nor dstId ($dstId) of this triplet.")
       dstAttr
     }
 

@@ -67,7 +67,25 @@ class ConnectedComponentsDataset[VD, ED] private[dataset] (
    * `"randomized_contraction"`, `"graphx"`).
    */
   def setAlgorithm(value: String): this.type = {
-    algorithmOpt = Some(value)
+    require(value != null, "algorithm must not be null.")
+    val normalized = value.toLowerCase(java.util.Locale.ROOT)
+    normalized match {
+      case ConnectedComponents.ALGO_GRAPHX | ConnectedComponents.ALGO_TWO_PHASE |
+          ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION =>
+        algorithmOpt = Some(normalized)
+      case ConnectedComponents.ALGO_GRAPHFRAMES =>
+        logWarn(
+          s"Algorithm '${ConnectedComponents.ALGO_GRAPHFRAMES}' is deprecated and will be removed " +
+            s"in a future release. Using '${ConnectedComponents.ALGO_TWO_PHASE}' instead.")
+        algorithmOpt = Some(ConnectedComponents.ALGO_TWO_PHASE)
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Unsupported algorithm: '$value'. " +
+            s"Supported values are: ${ConnectedComponents.ALGO_GRAPHX}, " +
+            s"${ConnectedComponents.ALGO_TWO_PHASE}, " +
+            s"${ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION}, " +
+            s"${ConnectedComponents.ALGO_GRAPHFRAMES} (deprecated).")
+    }
     this
   }
 

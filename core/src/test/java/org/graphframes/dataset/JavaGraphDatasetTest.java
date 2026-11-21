@@ -620,8 +620,48 @@ public class JavaGraphDatasetTest {
           Encoders.INT());
       assertEq(0L, emptyJava.degrees().count(), "empty Java graph degrees");
 
-      // JavaTriangleCount setLgNomEntries validation & chaining check
+      // JavaTriangleCount setLgNomEntries & eager setAlgorithm validation
       g.triangleCount().setLgNomEntries(8);
+      boolean caughtTcAlgo = false;
+      try {
+        g.triangleCount().setAlgorithm("invalid");
+      } catch (IllegalArgumentException expected) {
+        caughtTcAlgo = true;
+      }
+      assertEq(true, caughtTcAlgo, "JavaTriangleCount rejects invalid algorithm eagerly");
+
+      boolean caughtCcAlgo = false;
+      try {
+        g.connectedComponents().setAlgorithm("invalid");
+      } catch (IllegalArgumentException expected) {
+        caughtCcAlgo = true;
+      }
+      assertEq(true, caughtCcAlgo, "JavaConnectedComponents rejects invalid algorithm eagerly");
+
+      // Java typeOutDegree / typeInDegree / typeDegree with edgeTypes filter
+      List<Tuple3<Long, String, Integer>> outFiltered = g.typeOutDegree(
+          EdgeBean::getKind, Collections.singletonList("friend"), Encoders.STRING())
+          .collectAsList();
+      assertEq(2, outFiltered.size(), "typeOutDegree filtered count");
+      for (Tuple3<Long, String, Integer> row : outFiltered) {
+        assertEq("friend", row._2(), "typeOutDegree filtered category");
+      }
+
+      List<Tuple3<Long, String, Integer>> inFiltered = g.typeInDegree(
+          EdgeBean::getKind, Collections.singletonList("follow"), Encoders.STRING())
+          .collectAsList();
+      assertEq(1, inFiltered.size(), "typeInDegree filtered count");
+      assertEq(3L, inFiltered.get(0)._1(), "typeInDegree filtered vertex");
+
+      List<Tuple3<Long, String, Integer>> degFiltered = g.typeDegree(
+          EdgeBean::getKind, Arrays.asList("friend", "nonexistent"), Encoders.STRING())
+          .collectAsList();
+      assertEq(3, degFiltered.size(), "typeDegree filtered count");
+
+      List<Tuple3<Long, String, Integer>> degEmpty = g.typeDegree(
+          EdgeBean::getKind, Collections.emptyList(), Encoders.STRING())
+          .collectAsList();
+      assertEq(0, degEmpty.size(), "typeDegree empty edgeTypes filter");
     } finally {
       g.unpersist(true);
     }
