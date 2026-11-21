@@ -54,6 +54,18 @@ import java.util.Optional;
 public final class JavaPregel<VD, ED> implements Serializable {
 
   private static final String JOB_DESCRIPTION_KEY = "spark.job.description";
+  private static final String SRC_ID_COL = "srcId";
+  private static final String DST_ID_COL = "dstId";
+  private static final String ATTR_COL = "attr";
+  private static final String SRC_ATTR_COL = "srcAttr";
+  private static final String DST_ATTR_COL = "dstAttr";
+  private static final String SRC_ACTIVE_COL = "srcActive";
+  private static final String DST_ACTIVE_COL = "dstActive";
+  private static final String TUPLE_1 = "_1";
+  private static final String TUPLE_2 = "_2";
+  private static final String TUPLE_3 = "_3";
+  private static final String TUPLE_4 = "_4";
+  private static final String TUPLE_5 = "_5";
 
   private final JavaGraphDataset<VD, ED> graph;
   private int maxIter = 10;
@@ -279,8 +291,8 @@ public final class JavaPregel<VD, ED> implements Serializable {
       try {
         spark.sparkContext().setJobDescription(jobDescriptionPrefix + ": initialization");
         cachedEdgesDF = graph.edges()
-            .toDF("srcId", "dstId", "attr")
-            .repartition(functions.col("srcId"))
+            .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+            .repartition(functions.col(SRC_ID_COL))
             .persist(storageLevel);
 
         currentVertices = graph.vertices()
@@ -309,7 +321,7 @@ public final class JavaPregel<VD, ED> implements Serializable {
 
           Column msgKeyCol = prevMessages.col(prevMessages.columns()[0]);
           Dataset<Tuple3<Long, VD, Boolean>> updated = prevVertices
-              .joinWith(prevMessages, prevVertices.col("_1").equalTo(msgKeyCol), "left_outer")
+              .joinWith(prevMessages, prevVertices.col(TUPLE_1).equalTo(msgKeyCol), "left_outer")
               .map(
                   (MapFunction<Tuple2<Tuple3<Long, VD, Boolean>, Tuple2<Long, A>>,
                       Tuple3<Long, VD, Boolean>>) pair -> {
@@ -398,32 +410,33 @@ public final class JavaPregel<VD, ED> implements Serializable {
       Dataset<Tuple3<Long, VD, Boolean>> srcBase = (filterActive
           && (activeDirection.equals(EdgeDirection.Out())
               || activeDirection.equals(EdgeDirection.Both())))
-          ? vv.filter(functions.col("_3"))
+          ? vv.filter(functions.col(TUPLE_3))
           : vv;
       Dataset<Tuple3<Long, VD, Boolean>> dstBase = (filterActive
           && (activeDirection.equals(EdgeDirection.In())
               || activeDirection.equals(EdgeDirection.Both())))
-          ? vv.filter(functions.col("_3"))
+          ? vv.filter(functions.col(TUPLE_3))
           : vv;
 
-      Dataset<Row> srcV = srcBase.toDF("srcId", "srcAttr", "srcActive");
-      Dataset<Row> dstV = dstBase.toDF("dstId", "dstAttr", "dstActive");
+      Dataset<Row> srcV = srcBase.toDF(SRC_ID_COL, SRC_ATTR_COL, SRC_ACTIVE_COL);
+      Dataset<Row> dstV = dstBase.toDF(DST_ID_COL, DST_ATTR_COL, DST_ACTIVE_COL);
 
       Dataset<Row> joined = eeDF
-          .join(srcV, "srcId")
-          .join(dstV, "dstId");
+          .join(srcV, SRC_ID_COL)
+          .join(dstV, DST_ID_COL);
 
       if (filterActive && activeDirection.equals(EdgeDirection.Either())) {
-        joined = joined.filter(functions.col("srcActive").or(functions.col("dstActive")));
+        joined = joined.filter(
+            functions.col(SRC_ACTIVE_COL).or(functions.col(DST_ACTIVE_COL)));
       }
 
       return joined
           .select(
-              functions.col("srcId").alias("_1"),
-              functions.col("dstId").alias("_2"),
-              functions.col("srcAttr").alias("_3"),
-              functions.col("dstAttr").alias("_4"),
-              functions.col("attr").alias("_5"))
+              functions.col(SRC_ID_COL).alias(TUPLE_1),
+              functions.col(DST_ID_COL).alias(TUPLE_2),
+              functions.col(SRC_ATTR_COL).alias(TUPLE_3),
+              functions.col(DST_ATTR_COL).alias(TUPLE_4),
+              functions.col(ATTR_COL).alias(TUPLE_5))
           .as(tripletEnc);
     }
 

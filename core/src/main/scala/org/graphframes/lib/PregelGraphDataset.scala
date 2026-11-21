@@ -267,6 +267,16 @@ class TypedPregelBuilder[VD: TypeTag, ED: TypeTag, A: Encoder] private[lib] (
 
 object PregelGraphDataset extends Logging {
 
+  private val ID_COL = "id"
+  private val ATTR_COL = "attr"
+  private val ACTIVE_COL = "active"
+  private val SRC_ID_COL = "srcId"
+  private val DST_ID_COL = "dstId"
+  private val SRC_ATTR_COL = "srcAttr"
+  private val DST_ATTR_COL = "dstAttr"
+  private val SRC_ACTIVE_COL = "srcActive"
+  private val DST_ACTIVE_COL = "dstActive"
+
   /**
    * Execute a typed Pregel-like iterative vertex-parallel computation on a [[GraphDataset]] using
    * GraphX `EdgeTriplet` in `sendMsg`.
@@ -363,35 +373,40 @@ object PregelGraphDataset extends Logging {
         val srcV = {
           val base =
             if (filterActive && (activeDirection == EdgeDirection.Out || activeDirection == EdgeDirection.Both)) {
-              vv.filter(col("active"))
+              vv.filter(col(ACTIVE_COL))
             } else {
               vv
             }
-          base.toDF("srcId", "srcAttr", "srcActive")
+          base.toDF(SRC_ID_COL, SRC_ATTR_COL, SRC_ACTIVE_COL)
         }
         val dstV = {
           val base =
             if (filterActive && (activeDirection == EdgeDirection.In || activeDirection == EdgeDirection.Both)) {
-              vv.filter(col("active"))
+              vv.filter(col(ACTIVE_COL))
             } else {
               vv
             }
-          base.toDF("dstId", "dstAttr", "dstActive")
+          base.toDF(DST_ID_COL, DST_ATTR_COL, DST_ACTIVE_COL)
         }
 
         val joined = ee
-          .join(srcV, Seq("srcId"), "inner")
-          .join(dstV, Seq("dstId"), "inner")
+          .join(srcV, Seq(SRC_ID_COL), "inner")
+          .join(dstV, Seq(DST_ID_COL), "inner")
 
         val filtered =
           if (filterActive && activeDirection == EdgeDirection.Either) {
-            joined.filter(col("srcActive") || col("dstActive"))
+            joined.filter(col(SRC_ACTIVE_COL) || col(DST_ACTIVE_COL))
           } else {
             joined
           }
 
         filtered
-          .select(col("srcId"), col("dstId"), col("srcAttr"), col("dstAttr"), col("attr"))
+          .select(
+            col(SRC_ID_COL),
+            col(DST_ID_COL),
+            col(SRC_ATTR_COL),
+            col(DST_ATTR_COL),
+            col(ATTR_COL))
           .as[GraphTriplet[VD, ED]]
       }
 
@@ -405,8 +420,8 @@ object PregelGraphDataset extends Logging {
 
       spark.sparkContext.setJobDescription(s"$jobDescriptionPrefix: initialization")
       val cachedEdgesDF = graph.edges
-        .toDF("srcId", "dstId", "attr")
-        .repartition(col("srcId"))
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .repartition(col(SRC_ID_COL))
         .persist(intermediateStorageLevel)
       var currentVertices: Dataset[ActiveGraphVertex[VD]] = null
       var messages: Dataset[(VertexId, A)] = null
@@ -435,7 +450,7 @@ object PregelGraphDataset extends Logging {
 
           val msgKeyCol = prevMessages.col(prevMessages.columns.head)
           val updated: Dataset[ActiveGraphVertex[VD]] = prevVertices
-            .joinWith(prevMessages, prevVertices("id") === msgKeyCol, "left_outer")
+            .joinWith(prevMessages, prevVertices(ID_COL) === msgKeyCol, "left_outer")
             .map {
               case (v, null) => ActiveGraphVertex(v.id, v.attr, active = false)
               case (v, (_, msg)) =>

@@ -185,9 +185,11 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group utils
    */
   def validate(checkVertices: Boolean, intermediateStorageLevel: StorageLevel): Unit = {
-    val persistedVertices = vertices.select(col("id")).persist(intermediateStorageLevel)
+    import GraphDataset.*
+    val persistedVertices = vertices.select(col(ID_COL)).persist(intermediateStorageLevel)
     try {
-      val countDistinctVertices = persistedVertices.select(countDistinct("id")).first().getLong(0)
+      val countDistinctVertices =
+        persistedVertices.select(countDistinct(ID_COL)).first().getLong(0)
       val verticesCount = persistedVertices.count()
       if (countDistinctVertices != verticesCount) {
         throw new InvalidGraphException(
@@ -195,8 +197,8 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
       }
       if (checkVertices) {
         val verticesSetFromEdges = edges
-          .select(col("srcId").alias("id"))
-          .union(edges.select(col("dstId").alias("id")))
+          .select(col(SRC_ID_COL).alias(ID_COL))
+          .union(edges.select(col(DST_ID_COL).alias(ID_COL)))
           .distinct()
           .persist(intermediateStorageLevel)
         try {
@@ -207,7 +209,7 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
                 s"vertices, but vertices has $countDistinctVertices vertices.")
           }
           val countOfBadVertices = verticesSetFromEdges
-            .join(persistedVertices, Seq("id"), "left_anti")
+            .join(persistedVertices, Seq(ID_COL), "left_anti")
             .count()
           if (countOfBadVertices > 0) {
             throw new InvalidGraphException(
@@ -232,8 +234,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group utils
    */
   def asUndirected(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
     val reversed = edges
-      .select(col("dstId").alias("srcId"), col("srcId").alias("dstId"), col("attr"))
+      .select(col(DST_ID_COL).alias(SRC_ID_COL), col(SRC_ID_COL).alias(DST_ID_COL), col(ATTR_COL))
       .as[GraphEdge[ED]]
     GraphDataset(vertices, edges.union(reversed))
   }
@@ -244,8 +247,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group utils
    */
   def asReversed(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
     val reversed = edges
-      .select(col("dstId").alias("srcId"), col("srcId").alias("dstId"), col("attr"))
+      .select(col(DST_ID_COL).alias(SRC_ID_COL), col(SRC_ID_COL).alias(DST_ID_COL), col(ATTR_COL))
       .as[GraphEdge[ED]]
     GraphDataset(vertices, reversed)
   }
@@ -285,13 +289,19 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group structure
    */
   @transient lazy val triplets: Dataset[GraphTriplet[VD, ED]] = {
-    val srcV = vertices.toDF("srcId", "srcAttr")
-    val dstV = vertices.toDF("dstId", "dstAttr")
+    import GraphDataset.*
+    val srcV = vertices.toDF(SRC_ID_COL, SRC_ATTR_COL)
+    val dstV = vertices.toDF(DST_ID_COL, DST_ATTR_COL)
     edges
-      .toDF("srcId", "dstId", "attr")
-      .join(srcV, Seq("srcId"), "inner")
-      .join(dstV, Seq("dstId"), "inner")
-      .select(col("srcId"), col("dstId"), col("srcAttr"), col("dstAttr"), col("attr"))
+      .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+      .join(srcV, Seq(SRC_ID_COL), "inner")
+      .join(dstV, Seq(DST_ID_COL), "inner")
+      .select(
+        col(SRC_ID_COL),
+        col(DST_ID_COL),
+        col(SRC_ATTR_COL),
+        col(DST_ATTR_COL),
+        col(ATTR_COL))
       .as[GraphTriplet[VD, ED]]
   }
 
@@ -333,7 +343,7 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     val session = spark
     import session.implicits.*
     edges
-      .groupBy(col("srcId"))
+      .groupBy(col(GraphDataset.SRC_ID_COL))
       .agg(count("*").cast("int"))
       .as[(VertexId, Int)]
   }
@@ -347,7 +357,7 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
     val session = spark
     import session.implicits.*
     edges
-      .groupBy(col("dstId"))
+      .groupBy(col(GraphDataset.DST_ID_COL))
       .agg(count("*").cast("int"))
       .as[(VertexId, Int)]
   }
@@ -361,9 +371,10 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
   @transient lazy val degrees: Dataset[(VertexId, Int)] = {
     val session = spark
     import session.implicits.*
+    import GraphDataset.*
     edges
-      .select(explode(array(col("srcId"), col("dstId"))).alias("id"))
-      .groupBy(col("id"))
+      .select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
+      .groupBy(col(ID_COL))
       .agg(count("*").cast("int"))
       .as[(VertexId, Int)]
   }
@@ -431,11 +442,12 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group subgraph
    */
   def filterVertices(condition: GraphVertex[VD] => Boolean): GraphDataset[VD, ED] = {
+    import GraphDataset.*
     val vv: Dataset[GraphVertex[VD]] = vertices.filter(condition)
-    val vvIds = vv.select(col("id"))
+    val vvIds = vv.select(col(ID_COL))
     val ee: Dataset[GraphEdge[ED]] = edges
-      .join(vvIds, col("srcId") === vvIds("id"), "left_semi")
-      .join(vvIds, col("dstId") === vvIds("id"), "left_semi")
+      .join(vvIds, col(SRC_ID_COL) === vvIds(ID_COL), "left_semi")
+      .join(vvIds, col(DST_ID_COL) === vvIds(ID_COL), "left_semi")
       .as[GraphEdge[ED]]
     GraphDataset(vv, ee)
   }
@@ -468,10 +480,11 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group subgraph
    */
   def dropIsolatedVertices(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
     val ee: Dataset[GraphEdge[ED]] = edges
-    val activeIds = ee.select(explode(array(col("srcId"), col("dstId"))).alias("id"))
+    val activeIds = ee.select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
     val vv: Dataset[GraphVertex[VD]] = vertices
-      .join(activeIds, Seq("id"), "left_semi")
+      .join(activeIds, Seq(ID_COL), "left_semi")
       .as[GraphVertex[VD]]
     GraphDataset(vv, ee)
   }
@@ -726,26 +739,35 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
       weightExtractor: Option[ED => Double] = None): Dataset[ClusterAssignment] = {
     val session = spark
     import session.implicits.*
+    import GraphDataset.*
 
     val resDF = weightExtractor match {
       case Some(extract) =>
-        val weightColName = "_gf_pic_weight"
         val vDF = vertices.toDF(GraphFrame.ID, GraphFrame.ATTR)
         val eDF = edges
           .map(e => (e.srcId, e.dstId, extract(e.attr)))
-          .toDF(GraphFrame.SRC, GraphFrame.DST, weightColName)
-        GraphFrame(vDF, eDF).powerIterationClustering(k, maxIter, Some(weightColName))
+          .toDF(GraphFrame.SRC, GraphFrame.DST, PIC_WEIGHT_COL)
+        GraphFrame(vDF, eDF).powerIterationClustering(k, maxIter, Some(PIC_WEIGHT_COL))
       case None =>
         toGraphFrame.powerIterationClustering(k, maxIter, None)
     }
 
     resDF
-      .select(col(GraphFrame.ID).alias("id"), col("cluster").cast("int").alias("cluster"))
+      .select(col(GraphFrame.ID).alias(ID_COL), col(CLUSTER_COL).cast("int").alias(CLUSTER_COL))
       .as[ClusterAssignment]
   }
 }
 
 object GraphDataset extends Serializable with Logging {
+
+  private val ID_COL = "id"
+  private val ATTR_COL = "attr"
+  private val SRC_ID_COL = "srcId"
+  private val DST_ID_COL = "dstId"
+  private val SRC_ATTR_COL = "srcAttr"
+  private val DST_ATTR_COL = "dstAttr"
+  private val CLUSTER_COL = "cluster"
+  private val PIC_WEIGHT_COL = "_gf_pic_weight"
 
   /**
    * Construct a [[GraphDataset]] from typed vertex and edge datasets.
@@ -766,7 +788,7 @@ object GraphDataset extends Serializable with Logging {
     val session = edges.sparkSession
     import session.implicits.*
     val vertices: Dataset[GraphVertex[VD]] = edges
-      .select(explode(array(col("srcId"), col("dstId"))).alias("id"))
+      .select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
       .distinct()
       .as[VertexId]
       .map((id: VertexId) => GraphVertex(id, defaultVertexAttribute))
@@ -812,13 +834,13 @@ object GraphDataset extends Serializable with Logging {
         s"(columns: ${graph.edges.columns.mkString(", ")}).")
 
     val vv = graph.vertices
-      .select(col(GraphFrame.ID).cast("long").alias("id"), col(GraphFrame.ATTR).alias("attr"))
+      .select(col(GraphFrame.ID).cast("long").alias(ID_COL), col(GraphFrame.ATTR).alias(ATTR_COL))
       .as[GraphVertex[VD]]
     val ee = graph.edges
       .select(
-        col(GraphFrame.SRC).cast("long").alias("srcId"),
-        col(GraphFrame.DST).cast("long").alias("dstId"),
-        col(GraphFrame.ATTR).alias("attr"))
+        col(GraphFrame.SRC).cast("long").alias(SRC_ID_COL),
+        col(GraphFrame.DST).cast("long").alias(DST_ID_COL),
+        col(GraphFrame.ATTR).alias(ATTR_COL))
       .as[GraphEdge[ED]]
     apply(vv, ee)
   }

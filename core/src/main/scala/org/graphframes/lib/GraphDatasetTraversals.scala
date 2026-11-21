@@ -62,6 +62,30 @@ object GraphPath {
     Encoders.product[GraphPath[VD, ED]]
 }
 
+private object TraversalCols {
+  val ID_COL = "id"
+  val ATTR_COL = "attr"
+  val SRC_ID_COL = "srcId"
+  val DST_ID_COL = "dstId"
+  val SRC_ATTR_COL = "srcAttr"
+  val DST_ATTR_COL = "dstAttr"
+  val EDGE_ATTR_COL = "edgeAttr"
+  val ACC_COL = "acc"
+  val SHOULD_STOP_COL = "shouldStop"
+  val IS_TARGET_COL = "isTarget"
+  val FROM_COL = "from"
+  val TO_COL = "to"
+  val VERTICES_COL = "vertices"
+  val EDGES_COL = "edges"
+  val PATH_COL = "path"
+  val LEN_COL = "len"
+  val LENGTH_COL = "length"
+  val BFS_FROM_FLAG = "_gf_bfs_from"
+  val BFS_TO_FLAG = "_gf_bfs_to"
+  val ALL_PATHS_FROM_FLAG = "_gf_ap_from"
+  val ALL_PATHS_TO_FLAG = "_gf_ap_to"
+}
+
 private[lib] case class BFSFlaggedVertex[VD](
     id: VertexId,
     attr: VD,
@@ -121,26 +145,24 @@ class BFSDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
       fromPredicate.getOrElse(throw new IllegalArgumentException("fromPred is required."))
     val toFn = toPredicate.getOrElse(throw new IllegalArgumentException("toPred is required."))
 
+    import TraversalCols.*
     val spark = graph.spark
-
-    val fromCol = "_gf_bfs_from"
-    val toCol = "_gf_bfs_to"
 
     val vDF = graph.vertices
       .map(v => BFSFlaggedVertex(v.id, v.attr, fromFn(v), toFn(v)))
-      .toDF(GraphFrame.ID, GraphFrame.ATTR, fromCol, toCol)
+      .toDF(GraphFrame.ID, GraphFrame.ATTR, BFS_FROM_FLAG, BFS_TO_FLAG)
 
     val filteredEdges = edgePredicate.map(graph.edges.filter).getOrElse(graph.edges)
     val eDF = filteredEdges.toDF(GraphFrame.SRC, GraphFrame.DST, GraphFrame.ATTR)
 
     val resDF = GraphFrame(vDF, eDF).bfs
-      .fromExpr(col(fromCol))
-      .toExpr(col(toCol))
+      .fromExpr(col(BFS_FROM_FLAG))
+      .toExpr(col(BFS_TO_FLAG))
       .maxPathLength(maxPathLen)
       .run()
 
     val cols = resDF.columns
-    if (!cols.contains("from") || !cols.contains("to")) {
+    if (!cols.contains(FROM_COL) || !cols.contains(TO_COL)) {
       return spark.emptyDataset[GraphPath[VD, ED]]
     }
 
@@ -150,29 +172,33 @@ class BFSDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
       // 0-hop paths: from == to
       resDF
         .select(
-          array(struct(col("from.id").alias("id"), col("from.attr").alias("attr")))
-            .alias("vertices"),
-          typedLit(Seq.empty[GraphEdge[ED]]).alias("edges"))
+          array(
+            struct(
+              col(s"$FROM_COL.$ID_COL").alias(ID_COL),
+              col(s"$FROM_COL.$ATTR_COL").alias(ATTR_COL)))
+            .alias(VERTICES_COL),
+          typedLit(Seq.empty[GraphEdge[ED]]).alias(EDGES_COL))
         .as[GraphPath[VD, ED]]
     } else {
       val vertexCols = cols.filter(c =>
-        c == "from" || c == "to" ||
+        c == FROM_COL || c == TO_COL ||
           (c.startsWith("v") && c.length > 1 && c.drop(1).forall(_.isDigit)))
       val verticesExpr = array(
         vertexCols
-          .map(c => struct(col(s"$c.id").alias("id"), col(s"$c.attr").alias("attr")))
+          .map(c =>
+            struct(col(s"$c.$ID_COL").alias(ID_COL), col(s"$c.$ATTR_COL").alias(ATTR_COL)))
           .toIndexedSeq: _*)
       val edgesExpr = array(
         edgeCols
           .map(c =>
             struct(
-              col(s"$c.${GraphFrame.SRC}").alias("srcId"),
-              col(s"$c.${GraphFrame.DST}").alias("dstId"),
-              col(s"$c.${GraphFrame.ATTR}").alias("attr")))
+              col(s"$c.${GraphFrame.SRC}").alias(SRC_ID_COL),
+              col(s"$c.${GraphFrame.DST}").alias(DST_ID_COL),
+              col(s"$c.${GraphFrame.ATTR}").alias(ATTR_COL)))
           .toIndexedSeq: _*)
 
       resDF
-        .select(verticesExpr.alias("vertices"), edgesExpr.alias("edges"))
+        .select(verticesExpr.alias(VERTICES_COL), edgesExpr.alias(EDGES_COL))
         .as[GraphPath[VD, ED]]
     }
   }
@@ -253,31 +279,29 @@ class AllPathsDataset[VD, ED] private[graphframes] (private val graph: GraphData
       fromPredicate.getOrElse(throw new IllegalArgumentException("fromPred is required."))
     val toFn = toPredicate.getOrElse(throw new IllegalArgumentException("toPred is required."))
 
+    import TraversalCols.*
     val spark = graph.spark
     import spark.implicits.*
 
-    val fromCol = "_gf_ap_from"
-    val toCol = "_gf_ap_to"
-
     val vDF = graph.vertices
       .map(v => (v.id, fromFn(v), toFn(v)))
-      .toDF(GraphFrame.ID, fromCol, toCol)
+      .toDF(GraphFrame.ID, ALL_PATHS_FROM_FLAG, ALL_PATHS_TO_FLAG)
 
     val filteredEdges = edgePredicate.map(graph.edges.filter).getOrElse(graph.edges)
     val eDF = filteredEdges
-      .select(col("srcId").alias(GraphFrame.SRC), col("dstId").alias(GraphFrame.DST))
+      .select(col(SRC_ID_COL).alias(GraphFrame.SRC), col(DST_ID_COL).alias(GraphFrame.DST))
       .distinct()
 
     GraphFrame(vDF, eDF).allPaths
-      .fromExpr(col(fromCol))
-      .toExpr(col(toCol))
+      .fromExpr(col(ALL_PATHS_FROM_FLAG))
+      .toExpr(col(ALL_PATHS_TO_FLAG))
       .maxPathLength(maxPathLen)
       .setIsDirected(isDirected)
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .setCheckpointInterval(checkpointInterval)
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .run()
-      .select(col("path"), col("len").cast("int").alias("length"))
+      .select(col(PATH_COL), col(LEN_COL).cast("int").alias(LENGTH_COL))
       .as[SimplePath]
   }
 }
@@ -460,15 +484,16 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
       }
     }
 
+    import TraversalCols.*
     val filteredEdges = {
       val base = edgePredicate.map(graph.edges.filter).getOrElse(graph.edges)
-      if (removeLoops) base.filter(col("srcId") =!= col("dstId")) else base
+      if (removeLoops) base.filter(col(SRC_ID_COL) =!= col(DST_ID_COL)) else base
     }
 
     val semiTriplets = filteredEdges
-      .toDF("srcId", "dstId", "edgeAttr")
-      .join(graph.vertices.toDF("dstId", "dstAttr"), Seq("dstId"), "inner")
-      .repartition(col("srcId"))
+      .toDF(SRC_ID_COL, DST_ID_COL, EDGE_ATTR_COL)
+      .join(graph.vertices.toDF(DST_ID_COL, DST_ATTR_COL), Seq(DST_ID_COL), "inner")
+      .repartition(col(SRC_ID_COL))
       .persist(intermediateStorageLevel)
 
     val initFn = init
@@ -502,15 +527,15 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
         prevFinished = finished
 
         transitions = prevStates
-          .toDF("srcId", "srcAttr", "acc")
-          .join(semiTriplets, Seq("srcId"), "inner")
+          .toDF(SRC_ID_COL, SRC_ATTR_COL, ACC_COL)
+          .join(semiTriplets, Seq(SRC_ID_COL), "inner")
           .select(
-            col("srcId"),
-            col("dstId"),
-            col("srcAttr"),
-            col("dstAttr"),
-            col("edgeAttr"),
-            col("acc"))
+            col(SRC_ID_COL),
+            col(DST_ID_COL),
+            col(SRC_ATTR_COL),
+            col(DST_ATTR_COL),
+            col(EDGE_ATTR_COL),
+            col(ACC_COL))
           .as[TraversalStep[VD, ED, S]]
           .map { step =>
             val triplet =
@@ -523,13 +548,13 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
           .persist(intermediateStorageLevel)
 
         val nextStatesRaw = transitions
-          .filter(!col("shouldStop"))
+          .filter(!col(SHOULD_STOP_COL))
           .map(t => TraversalFrontierState(t.id, t.attr, t.acc))
 
         val newlyCollected = {
           val filtered =
-            if (hasTarget) transitions.filter(col("isTarget"))
-            else transitions.filter(col("shouldStop"))
+            if (hasTarget) transitions.filter(col(IS_TARGET_COL))
+            else transitions.filter(col(SHOULD_STOP_COL))
           filtered.map(t => NeighborAggregateResult(t.id, currentHop, t.acc))
         }
 

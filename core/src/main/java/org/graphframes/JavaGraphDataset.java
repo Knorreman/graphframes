@@ -72,7 +72,42 @@ import java.util.stream.Collectors;
  */
 public class JavaGraphDataset<VD, ED> implements Serializable {
 
+  private static final String ID_COL = "id";
   private static final String ATTR_COL = "attr";
+  private static final String SRC_ID_COL = "srcId";
+  private static final String DST_ID_COL = "dstId";
+  private static final String SRC_ATTR_COL = "srcAttr";
+  private static final String DST_ATTR_COL = "dstAttr";
+  private static final String KEY_COL = "k";
+  private static final String CNT_COL = "cnt";
+  private static final String CLUSTER_COL = "cluster";
+  private static final String PIC_WEIGHT_COL = "_gf_pic_weight";
+  private static final String COMPONENT_COL = "component";
+  private static final String CONNECTED_COMPONENT_COL = "connectedComponent";
+  private static final String PAGERANK_COL = "pagerank";
+  private static final String WEIGHT_COL = "weight";
+  private static final String DISTANCES_COL = "distances";
+  private static final String COUNT_COL = "count";
+  private static final String LABEL_COL = "label";
+  private static final String KCORE_COL = "kcore";
+  private static final String FROM_COL = "from";
+  private static final String TO_COL = "to";
+  private static final String PATH_COL = "path";
+  private static final String LEN_COL = "len";
+  private static final String LENGTH_COL = "length";
+  private static final String BFS_FROM_FLAG = "_gf_jbfs_from";
+  private static final String BFS_TO_FLAG = "_gf_jbfs_to";
+  private static final String ALL_PATHS_FROM_FLAG = "_gf_jap_from";
+  private static final String ALL_PATHS_TO_FLAG = "_gf_jap_to";
+  private static final String COLUMN1_COL = "column1";
+  private static final String COLUMN2_COL = "column2";
+  private static final String COLUMN3_COL = "column3";
+  private static final String COLUMN4_COL = "column4";
+  private static final String TUPLE_1 = "_1";
+  private static final String TUPLE_2 = "_2";
+  private static final String TUPLE_3 = "_3";
+  private static final String TUPLE_4 = "_4";
+  private static final String TUPLE_5 = "_5";
 
   private final transient Dataset<Tuple2<Long, VD>> vertices;
   private final transient Dataset<Tuple3<Long, Long, ED>> edges;
@@ -114,9 +149,10 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     Objects.requireNonNull(vdEncoder, "vdEncoder must not be null");
     Objects.requireNonNull(edEncoder, "edEncoder must not be null");
     Dataset<Long> ids = edges
-        .toDF("srcId", "dstId", ATTR_COL)
-        .select(functions.explode(functions.array(functions.col("srcId"), functions.col("dstId")))
-            .alias("id"))
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .select(functions.explode(
+                functions.array(functions.col(SRC_ID_COL), functions.col(DST_ID_COL)))
+            .alias(ID_COL))
         .distinct()
         .as(Encoders.LONG());
     Dataset<Tuple2<Long, VD>> vertices = ids.map(
@@ -181,14 +217,14 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
         Encoders.tuple(Encoders.LONG(), Encoders.LONG(), edEncoder);
     Dataset<Tuple2<Long, VD>> vv = graph.vertices()
         .select(
-            functions.col(GraphFrame.ID()).cast("long").alias("_1"),
-            functions.col(ATTR_COL).alias("_2"))
+            functions.col(GraphFrame.ID()).cast("long").alias(TUPLE_1),
+            functions.col(ATTR_COL).alias(TUPLE_2))
         .as(vEnc);
     Dataset<Tuple3<Long, Long, ED>> ee = graph.edges()
         .select(
-            functions.col(GraphFrame.SRC()).cast("long").alias("_1"),
-            functions.col(GraphFrame.DST()).cast("long").alias("_2"),
-            functions.col(ATTR_COL).alias("_3"))
+            functions.col(GraphFrame.SRC()).cast("long").alias(TUPLE_1),
+            functions.col(GraphFrame.DST()).cast("long").alias(TUPLE_2),
+            functions.col(ATTR_COL).alias(TUPLE_3))
         .as(eEnc);
     return new JavaGraphDataset<>(vv, ee, vdEncoder, edEncoder);
   }
@@ -238,18 +274,18 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
    * whose endpoints exist in {@code vertices()}.
    */
   public Dataset<Tuple5<Long, Long, VD, VD, ED>> triplets() {
-    Dataset<Row> srcV = vertices().toDF("srcId", "srcAttr");
-    Dataset<Row> dstV = vertices().toDF("dstId", "dstAttr");
+    Dataset<Row> srcV = vertices().toDF(SRC_ID_COL, SRC_ATTR_COL);
+    Dataset<Row> dstV = vertices().toDF(DST_ID_COL, DST_ATTR_COL);
     return edges()
-        .toDF("srcId", "dstId", "attr")
-        .join(srcV, "srcId")
-        .join(dstV, "dstId")
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .join(srcV, SRC_ID_COL)
+        .join(dstV, DST_ID_COL)
         .select(
-            functions.col("srcId").alias("_1"),
-            functions.col("dstId").alias("_2"),
-            functions.col("srcAttr").alias("_3"),
-            functions.col("dstAttr").alias("_4"),
-            functions.col("attr").alias("_5"))
+            functions.col(SRC_ID_COL).alias(TUPLE_1),
+            functions.col(DST_ID_COL).alias(TUPLE_2),
+            functions.col(SRC_ATTR_COL).alias(TUPLE_3),
+            functions.col(DST_ATTR_COL).alias(TUPLE_4),
+            functions.col(ATTR_COL).alias(TUPLE_5))
         .as(tripletEncoder());
   }
 
@@ -312,11 +348,11 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Returns a new graph with all edge directions reversed. */
   public JavaGraphDataset<VD, ED> asReversed() {
     Dataset<Tuple3<Long, Long, ED>> rev = edges()
-        .toDF("_1", "_2", "_3")
+        .toDF(TUPLE_1, TUPLE_2, TUPLE_3)
         .select(
-            functions.col("_2").alias("_1"),
-            functions.col("_1").alias("_2"),
-            functions.col("_3"))
+            functions.col(TUPLE_2).alias(TUPLE_1),
+            functions.col(TUPLE_1).alias(TUPLE_2),
+            functions.col(TUPLE_3))
         .as(edgeEncoder());
     return new JavaGraphDataset<>(vertices(), rev, vdEncoder, edEncoder);
   }
@@ -328,11 +364,11 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
    */
   public JavaGraphDataset<VD, ED> asUndirected() {
     Dataset<Tuple3<Long, Long, ED>> rev = edges()
-        .toDF("_1", "_2", "_3")
+        .toDF(TUPLE_1, TUPLE_2, TUPLE_3)
         .select(
-            functions.col("_2").alias("_1"),
-            functions.col("_1").alias("_2"),
-            functions.col("_3"))
+            functions.col(TUPLE_2).alias(TUPLE_1),
+            functions.col(TUPLE_1).alias(TUPLE_2),
+            functions.col(TUPLE_3))
         .as(edgeEncoder());
     return new JavaGraphDataset<>(vertices(), edges().union(rev), vdEncoder, edEncoder);
   }
@@ -341,30 +377,31 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   public Dataset<Tuple2<Long, Integer>> outDegrees() {
     return edges()
-        .toDF("srcId", "dstId", "attr")
-        .groupBy(functions.col("srcId"))
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .groupBy(functions.col(SRC_ID_COL))
         .agg(functions.count("*").cast("int"))
-        .toDF("_1", "_2")
+        .toDF(TUPLE_1, TUPLE_2)
         .as(Encoders.tuple(Encoders.LONG(), Encoders.INT()));
   }
 
   public Dataset<Tuple2<Long, Integer>> inDegrees() {
     return edges()
-        .toDF("srcId", "dstId", "attr")
-        .groupBy(functions.col("dstId"))
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .groupBy(functions.col(DST_ID_COL))
         .agg(functions.count("*").cast("int"))
-        .toDF("_1", "_2")
+        .toDF(TUPLE_1, TUPLE_2)
         .as(Encoders.tuple(Encoders.LONG(), Encoders.INT()));
   }
 
   public Dataset<Tuple2<Long, Integer>> degrees() {
     return edges()
-        .toDF("srcId", "dstId", "attr")
-        .select(functions.explode(functions.array(functions.col("srcId"), functions.col("dstId")))
-            .alias("id"))
-        .groupBy(functions.col("id"))
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .select(functions.explode(
+                functions.array(functions.col(SRC_ID_COL), functions.col(DST_ID_COL)))
+            .alias(ID_COL))
+        .groupBy(functions.col(ID_COL))
         .agg(functions.count("*").cast("int"))
-        .toDF("_1", "_2")
+        .toDF(TUPLE_1, TUPLE_2)
         .as(Encoders.tuple(Encoders.LONG(), Encoders.INT()));
   }
 
@@ -418,14 +455,14 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   private <K> Dataset<Tuple3<Long, K, Integer>> countByKey(
       Dataset<Tuple2<Long, K>> pairs, Encoder<K> keyEncoder) {
     return pairs
-        .toDF("id", "k")
-        .filter(functions.col("k").isNotNull())
-        .groupBy(functions.col("id"), functions.col("k"))
-        .agg(functions.count("*").cast("int").alias("cnt"))
+        .toDF(ID_COL, KEY_COL)
+        .filter(functions.col(KEY_COL).isNotNull())
+        .groupBy(functions.col(ID_COL), functions.col(KEY_COL))
+        .agg(functions.count("*").cast("int").alias(CNT_COL))
         .select(
-            functions.col("id").alias("_1"),
-            functions.col("k").alias("_2"),
-            functions.col("cnt").alias("_3"))
+            functions.col(ID_COL).alias(TUPLE_1),
+            functions.col(KEY_COL).alias(TUPLE_2),
+            functions.col(CNT_COL).alias(TUPLE_3))
         .as(Encoders.tuple(Encoders.LONG(), keyEncoder, Encoders.INT()));
   }
 
@@ -436,11 +473,11 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     Objects.requireNonNull(condition, "condition must not be null");
     Dataset<Tuple2<Long, VD>> vv = vertices().filter(
         (FilterFunction<Tuple2<Long, VD>>) v -> condition.call(new GraphVertex<>(v._1(), v._2())));
-    Dataset<Row> vvIds = vv.toDF("id", "attr").select(functions.col("id"));
+    Dataset<Row> vvIds = vv.toDF(ID_COL, ATTR_COL).select(functions.col(ID_COL));
     Dataset<Tuple3<Long, Long, ED>> ee = edges()
-        .toDF("_1", "_2", "_3")
-        .join(vvIds, functions.col("_1").equalTo(vvIds.col("id")), "left_semi")
-        .join(vvIds, functions.col("_2").equalTo(vvIds.col("id")), "left_semi")
+        .toDF(TUPLE_1, TUPLE_2, TUPLE_3)
+        .join(vvIds, functions.col(TUPLE_1).equalTo(vvIds.col(ID_COL)), "left_semi")
+        .join(vvIds, functions.col(TUPLE_2).equalTo(vvIds.col(ID_COL)), "left_semi")
         .as(edgeEncoder());
     return new JavaGraphDataset<>(vv, ee, vdEncoder, edEncoder);
   }
@@ -463,12 +500,13 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Drops vertices that are not incident to any edge. */
   public JavaGraphDataset<VD, ED> dropIsolatedVertices() {
     Dataset<Row> activeIds = edges()
-        .toDF("srcId", "dstId", "attr")
-        .select(functions.explode(functions.array(functions.col("srcId"), functions.col("dstId")))
-            .alias("id"));
+        .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+        .select(functions.explode(
+                functions.array(functions.col(SRC_ID_COL), functions.col(DST_ID_COL)))
+            .alias(ID_COL));
     Dataset<Tuple2<Long, VD>> vv = vertices()
-        .toDF("_1", "_2")
-        .join(activeIds, functions.col("_1").equalTo(activeIds.col("id")), "left_semi")
+        .toDF(TUPLE_1, TUPLE_2)
+        .join(activeIds, functions.col(TUPLE_1).equalTo(activeIds.col(ID_COL)), "left_semi")
         .as(vertexEncoder());
     return new JavaGraphDataset<>(vv, edges(), vdEncoder, edEncoder);
   }
@@ -596,8 +634,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     return toGraphFrame()
         .powerIterationClustering(k, maxIter, scala.Option.empty())
         .select(
-            functions.col(GraphFrame.ID()).alias("id"),
-            functions.col("cluster").cast("int").alias("cluster"))
+            functions.col(GraphFrame.ID()).alias(ID_COL),
+            functions.col(CLUSTER_COL).cast("int").alias(CLUSTER_COL))
         .as(ClusterAssignment.encoder());
   }
 
@@ -605,19 +643,18 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   public Dataset<ClusterAssignment> powerIterationClustering(
       int k, int maxIter, MapFunction<ED, Double> weightExtractor) {
     Objects.requireNonNull(weightExtractor, "weightExtractor must not be null");
-    String weightCol = "_gf_pic_weight";
     Dataset<Row> vDF = vertices().toDF(GraphFrame.ID(), ATTR_COL);
     Dataset<Row> eDF = edges()
         .map(
             (MapFunction<Tuple3<Long, Long, ED>, Tuple3<Long, Long, Double>>)
                 e -> new Tuple3<>(e._1(), e._2(), weightExtractor.call(e._3())),
             Encoders.tuple(Encoders.LONG(), Encoders.LONG(), Encoders.DOUBLE()))
-        .toDF(GraphFrame.SRC(), GraphFrame.DST(), weightCol);
+        .toDF(GraphFrame.SRC(), GraphFrame.DST(), PIC_WEIGHT_COL);
     return GraphFrame.apply(vDF, eDF)
-        .powerIterationClustering(k, maxIter, scala.Option.apply(weightCol))
+        .powerIterationClustering(k, maxIter, scala.Option.apply(PIC_WEIGHT_COL))
         .select(
-            functions.col(GraphFrame.ID()).alias("id"),
-            functions.col("cluster").cast("int").alias("cluster"))
+            functions.col(GraphFrame.ID()).alias(ID_COL),
+            functions.col(CLUSTER_COL).cast("int").alias(CLUSTER_COL))
         .as(ClusterAssignment.encoder());
   }
 
@@ -755,8 +792,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = cc.run();
       Dataset<ConnectedComponentResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.col("component").alias("connectedComponent"))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.col(COMPONENT_COL).alias(CONNECTED_COMPONENT_COL))
           .as(ConnectedComponentResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, targetLevel);
     }
@@ -816,18 +853,18 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
           Encoders.tuple(graph.edgeAttrEncoder(), Encoders.DOUBLE());
       Dataset<Tuple2<Long, Tuple2<VD, Double>>> vv = resGF.vertices()
           .select(
-              functions.col(GraphFrame.ID()).alias("_1"),
+              functions.col(GraphFrame.ID()).alias(TUPLE_1),
               functions.struct(
-                  functions.col(ATTR_COL).alias("_1"),
-                  functions.col("pagerank").alias("_2")).alias("_2"))
+                  functions.col(ATTR_COL).alias(TUPLE_1),
+                  functions.col(PAGERANK_COL).alias(TUPLE_2)).alias(TUPLE_2))
           .as(Encoders.tuple(Encoders.LONG(), vAttrEnc));
       Dataset<Tuple3<Long, Long, Tuple2<ED, Double>>> ee = resGF.edges()
           .select(
-              functions.col(GraphFrame.SRC()).alias("_1"),
-              functions.col(GraphFrame.DST()).alias("_2"),
+              functions.col(GraphFrame.SRC()).alias(TUPLE_1),
+              functions.col(GraphFrame.DST()).alias(TUPLE_2),
               functions.struct(
-                  functions.col(ATTR_COL).alias("_1"),
-                  functions.col("weight").alias("_2")).alias("_3"))
+                  functions.col(ATTR_COL).alias(TUPLE_1),
+                  functions.col(WEIGHT_COL).alias(TUPLE_2)).alias(TUPLE_3))
           .as(Encoders.tuple(Encoders.LONG(), Encoders.LONG(), eAttrEnc));
       return materializeGraphAndReleaseRaw(
           resGF, vv, ee, vAttrEnc, eAttrEnc, StorageLevel.MEMORY_AND_DISK());
@@ -894,7 +931,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       sp.setIntermediateStorageLevel(storageLevel);
       Dataset<Row> rawDF = sp.run();
       Dataset<ShortestPathsResult> typed = rawDF
-          .select(functions.col(GraphFrame.ID()).alias("id"), functions.col("distances"))
+          .select(functions.col(GraphFrame.ID()).alias(ID_COL), functions.col(DISTANCES_COL))
           .as(ShortestPathsResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
@@ -943,8 +980,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = tc.run();
       Dataset<TriangleCountResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.col("count").cast("long").alias("count"))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.col(COUNT_COL).cast("long").alias(COUNT_COL))
           .as(TriangleCountResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
@@ -1005,10 +1042,10 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       // GraphFrames LPA can emit null label for vertices with zero incoming edges
       Dataset<LabelPropagationResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.coalesce(functions.col("label"), functions.col(GraphFrame.ID()))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.coalesce(functions.col(LABEL_COL), functions.col(GraphFrame.ID()))
                   .cast("long")
-                  .alias("label"))
+                  .alias(LABEL_COL))
           .as(LabelPropagationResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
@@ -1039,8 +1076,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = scc.run();
       Dataset<ConnectedComponentResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.col("component").alias("connectedComponent"))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.col(COMPONENT_COL).alias(CONNECTED_COMPONENT_COL))
           .as(ConnectedComponentResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, StorageLevel.MEMORY_AND_DISK());
     }
@@ -1084,8 +1121,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = kc.run();
       Dataset<KCoreResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.col(KCore.kCoreColumnName()).alias("kcore"))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.col(KCore.kCoreColumnName()).alias(KCORE_COL))
           .as(KCoreResult.encoder());
       return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
@@ -1128,10 +1165,10 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       mis.setCheckpointInterval(checkpointInterval);
       mis.setIntermediateStorageLevel(storageLevel);
       Dataset<Row> rawMis = mis.run(seed);
-      Dataset<Row> misIds = rawMis.select(functions.col(GraphFrame.ID()).alias("id"));
+      Dataset<Row> misIds = rawMis.select(functions.col(GraphFrame.ID()).alias(ID_COL));
       Dataset<Tuple2<Long, VD>> typed = graph.vertices()
-          .toDF("_1", "_2")
-          .join(misIds, functions.col("_1").equalTo(misIds.col("id")), "left_semi")
+          .toDF(TUPLE_1, TUPLE_2)
+          .join(misIds, functions.col(TUPLE_1).equalTo(misIds.col(ID_COL)), "left_semi")
           .as(graph.vertexEncoder());
       return materializeAndReleaseRaw(rawMis, typed, storageLevel);
     }
@@ -1175,8 +1212,9 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = dc.run();
       Dataset<SimplePath> typed = rawDF
           .select(
-              functions.col(DetectingCycles.foundSeqCol()).alias("path"),
-              functions.size(functions.col(DetectingCycles.foundSeqCol())).minus(1).alias("length"))
+              functions.col(DetectingCycles.foundSeqCol()).alias(PATH_COL),
+              functions.size(functions.col(DetectingCycles.foundSeqCol())).minus(1)
+                  .alias(LENGTH_COL))
           .as(SimplePath.encoder());
       return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
@@ -1224,8 +1262,6 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       FilterFunction<GraphVertex<VD>> fFn = fromPred;
       FilterFunction<GraphVertex<VD>> tFn = toPred;
 
-      String fromCol = "_gf_jbfs_from";
-      String toCol = "_gf_jbfs_to";
       Dataset<Row> vDF = graph.vertices()
           .map(
               (MapFunction<Tuple2<Long, VD>, Tuple3<Long, Boolean, Boolean>>) v -> {
@@ -1233,7 +1269,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
                 return new Tuple3<>(v._1(), fFn.call(gv), tFn.call(gv));
               },
               Encoders.tuple(Encoders.LONG(), Encoders.BOOLEAN(), Encoders.BOOLEAN()))
-          .toDF(GraphFrame.ID(), fromCol, toCol);
+          .toDF(GraphFrame.ID(), BFS_FROM_FLAG, BFS_TO_FLAG);
 
       JavaGraphDataset<VD, ED> edgeFiltered =
           edgeFilter != null ? graph.filterEdges(edgeFilter) : graph;
@@ -1242,13 +1278,13 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
           .select(GraphFrame.SRC(), GraphFrame.DST());
 
       Dataset<Row> resDF = GraphFrame.apply(vDF, eDF).bfs()
-          .fromExpr(functions.col(fromCol))
-          .toExpr(functions.col(toCol))
+          .fromExpr(functions.col(BFS_FROM_FLAG))
+          .toExpr(functions.col(BFS_TO_FLAG))
           .maxPathLength(maxPathLength)
           .run();
 
       List<String> cols = Arrays.asList(resDF.columns());
-      if (!cols.contains("from") || !cols.contains("to")) {
+      if (!cols.contains(FROM_COL) || !cols.contains(TO_COL)) {
         return graph.spark().emptyDataset(SimplePath.encoder());
       }
 
@@ -1258,19 +1294,19 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       if (edgeCols.isEmpty()) {
         return resDF
             .select(
-                functions.array(functions.col("from.id")).alias("path"),
-                functions.lit(0).alias("length"))
+                functions.array(functions.col(FROM_COL + "." + ID_COL)).alias(PATH_COL),
+                functions.lit(0).alias(LENGTH_COL))
             .as(SimplePath.encoder());
       }
       Column[] vIdCols = cols.stream()
-          .filter(c -> c.equals("from") || c.equals("to")
+          .filter(c -> c.equals(FROM_COL) || c.equals(TO_COL)
               || (c.startsWith("v") && c.length() > 1 && c.substring(1).matches("\\d+")))
-          .map(c -> functions.col(c + ".id"))
+          .map(c -> functions.col(c + "." + ID_COL))
           .toArray(Column[]::new);
       return resDF
           .select(
-              functions.array(vIdCols).alias("path"),
-              functions.lit(edgeCols.size()).alias("length"))
+              functions.array(vIdCols).alias(PATH_COL),
+              functions.lit(edgeCols.size()).alias(LENGTH_COL))
           .as(SimplePath.encoder());
     }
   }
@@ -1341,8 +1377,6 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       FilterFunction<GraphVertex<VD>> fFn = fromPred;
       FilterFunction<GraphVertex<VD>> tFn = toPred;
 
-      String fromCol = "_gf_jap_from";
-      String toCol = "_gf_jap_to";
       Dataset<Row> vDF = graph.vertices()
           .map(
               (MapFunction<Tuple2<Long, VD>, Tuple3<Long, Boolean, Boolean>>) v -> {
@@ -1350,7 +1384,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
                 return new Tuple3<>(v._1(), fFn.call(gv), tFn.call(gv));
               },
               Encoders.tuple(Encoders.LONG(), Encoders.BOOLEAN(), Encoders.BOOLEAN()))
-          .toDF(GraphFrame.ID(), fromCol, toCol);
+          .toDF(GraphFrame.ID(), ALL_PATHS_FROM_FLAG, ALL_PATHS_TO_FLAG);
 
       JavaGraphDataset<VD, ED> edgeFiltered =
           edgeFilter != null ? graph.filterEdges(edgeFilter) : graph;
@@ -1360,15 +1394,17 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
           .distinct();
 
       org.graphframes.lib.AllPaths ap = GraphFrame.apply(vDF, eDF).allPaths();
-      ap.fromExpr(functions.col(fromCol));
-      ap.toExpr(functions.col(toCol));
+      ap.fromExpr(functions.col(ALL_PATHS_FROM_FLAG));
+      ap.toExpr(functions.col(ALL_PATHS_TO_FLAG));
       ap.maxPathLength(maxPathLength);
       ap.setIsDirected(isDirected);
       ap.setUseLocalCheckpoints(useLocalCheckpoints);
       ap.setCheckpointInterval(checkpointInterval);
       ap.setIntermediateStorageLevel(storageLevel);
       return ap.run()
-          .select(functions.col("path"), functions.col("len").cast("int").alias("length"))
+          .select(
+              functions.col(PATH_COL),
+              functions.col(LEN_COL).cast("int").alias(LENGTH_COL))
           .as(SimplePath.encoder());
     }
   }
@@ -1457,11 +1493,11 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Row> rawDF = svd.run();
       Dataset<SVDPlusPlusResult> typed = rawDF
           .select(
-              functions.col(GraphFrame.ID()).alias("id"),
-              functions.col(SVDPlusPlus.COLUMN1()).alias("column1"),
-              functions.col(SVDPlusPlus.COLUMN2()).alias("column2"),
-              functions.col(SVDPlusPlus.COLUMN3()).alias("column3"),
-              functions.col(SVDPlusPlus.COLUMN4()).alias("column4"))
+              functions.col(GraphFrame.ID()).alias(ID_COL),
+              functions.col(SVDPlusPlus.COLUMN1()).alias(COLUMN1_COL),
+              functions.col(SVDPlusPlus.COLUMN2()).alias(COLUMN2_COL),
+              functions.col(SVDPlusPlus.COLUMN3()).alias(COLUMN3_COL),
+              functions.col(SVDPlusPlus.COLUMN4()).alias(COLUMN4_COL))
           .as(SVDPlusPlusResult.encoder());
       Dataset<SVDPlusPlusResult> persisted =
           materializeAndReleaseRaw(rawDF, typed, StorageLevel.MEMORY_AND_DISK());
