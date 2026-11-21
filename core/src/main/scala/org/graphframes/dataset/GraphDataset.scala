@@ -1,0 +1,872 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.graphframes.dataset
+
+import org.apache.spark.graphframes.graphx.Edge
+import org.apache.spark.graphframes.graphx.Graph
+import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.Encoder
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.array
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.count
+import org.apache.spark.sql.functions.countDistinct
+import org.apache.spark.sql.functions.explode
+import org.apache.spark.sql.types.ByteType
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.ShortType
+import org.apache.spark.storage.StorageLevel
+import org.graphframes.GraphFrame
+import org.graphframes.GraphFramesUnsupportedVertexTypeException
+import org.graphframes.InvalidGraphException
+import org.graphframes.Logging
+import org.graphframes.dataset.lib.AggregateMessagesDataset
+import org.graphframes.dataset.lib.AggregateNeighborsDataset
+import org.graphframes.dataset.lib.AllPathsDataset
+import org.graphframes.dataset.lib.BFSDataset
+import org.graphframes.dataset.lib.ClusterAssignment
+import org.graphframes.dataset.lib.ConnectedComponentsDataset
+import org.graphframes.dataset.lib.DetectingCyclesDataset
+import org.graphframes.dataset.lib.HyperANFDataset
+import org.graphframes.dataset.lib.KCoreDataset
+import org.graphframes.dataset.lib.LabelPropagationDataset
+import org.graphframes.dataset.lib.MaximalIndependentSetDataset
+import org.graphframes.dataset.lib.PageRankDataset
+import org.graphframes.dataset.lib.ParallelPersonalizedPageRankDataset
+import org.graphframes.dataset.lib.PregelGraphDataset
+import org.graphframes.dataset.lib.RandomWalkEmbeddingsDataset
+import org.graphframes.dataset.lib.SVDPlusPlusDataset
+import org.graphframes.dataset.lib.ShortestPathsDataset
+import org.graphframes.dataset.lib.StronglyConnectedComponentsDataset
+import org.graphframes.dataset.lib.StructureAwareLabelPropagationDataset
+import org.graphframes.dataset.lib.TriangleCountDataset
+import org.graphframes.dataset.lib.TypedDegreeMetrics
+import org.graphframes.dataset.lib.TypedDegreePair
+import org.graphframes.dataset.lib.TypedDegreeResult
+
+import scala.reflect.ClassTag
+import scala.reflect.runtime.universe.TypeTag
+
+/**
+ * A typed representation of a graph backed by Spark `Dataset`s of [[GraphVertex]] and
+ * [[GraphEdge]].
+ *
+ * @tparam VD
+ *   the vertex attribute type
+ * @tparam ED
+ *   the edge attribute type
+ *
+ * @groupname structure Structure information
+ * @groupname conversions Conversions
+ * @groupname stdlib Standard graph algorithms
+ * @groupname subgraph Subgraph selection and transformations
+ * @groupname degree Graph topology
+ * @groupname gml Graph Machine Learning
+ * @groupname utils Utility Methods
+ */
+class GraphDataset[VD: TypeTag, ED: TypeTag] private (
+    @transient private val _vertices: Dataset[GraphVertex[VD]],
+    @transient private val _edges: Dataset[GraphEdge[ED]])
+    extends Logging
+    with Serializable {
+
+  /** Default constructor is provided to support serialization. */
+  protected def this() = this(null, null)
+
+  private[dataset] def spark: SparkSession = vertices.sparkSession
+
+  /**
+   * Return a string representation of the GraphDataset.
+   *
+   * @group utils
+   */
+  override def toString: String = {
+    s"GraphDataset(v:${vertices.toString}, e:${edges.toString})"
+  }
+
+  /**
+   * Persist the dataset representation of vertices and edges of the graph with the default
+   * storage level.
+   *
+   * @group utils
+   */
+  def cache(): this.type = {
+    persist()
+  }
+
+  /**
+   * Persist the dataset representation of vertices and edges of the graph with the default
+   * storage level.
+   *
+   * @group utils
+   */
+  def persist(): this.type = {
+    vertices.persist()
+    edges.persist()
+    this
+  }
+
+  /**
+   * Persist the dataset representation of vertices and edges of the graph with the given storage
+   * level.
+   *
+   * @param newLevel
+   *   One of: `MEMORY_ONLY`, `MEMORY_AND_DISK`, `MEMORY_ONLY_SER`, `MEMORY_AND_DISK_SER`,
+   *   `DISK_ONLY`, `MEMORY_ONLY_2`, `MEMORY_AND_DISK_2`, etc.
+   * @group utils
+   */
+  def persist(newLevel: StorageLevel): this.type = {
+    vertices.persist(newLevel)
+    edges.persist(newLevel)
+    this
+  }
+
+  /**
+   * Mark the dataset representation of vertices and edges of the graph as non-persistent, and
+   * remove all blocks for it from memory and disk.
+   *
+   * @group utils
+   */
+  def unpersist(): this.type = {
+    vertices.unpersist()
+    edges.unpersist()
+    this
+  }
+
+  /**
+   * Mark the dataset representation of vertices and edges of the graph as non-persistent, and
+   * remove all blocks for it from memory and disk.
+   *
+   * @param blocking
+   *   Whether to block until all blocks are deleted.
+   * @group utils
+   */
+  def unpersist(blocking: Boolean): this.type = {
+    vertices.unpersist(blocking)
+    edges.unpersist(blocking)
+    this
+  }
+
+  /**
+   * Validates the consistency and integrity of a graph by performing checks on the vertices and
+   * edges.
+   *
+   * @throws InvalidGraphException
+   *   if there are any inconsistencies in the graph, such as duplicate vertices or edges
+   *   referencing vertices not present in the vertices dataset.
+   * @group utils
+   */
+  def validate(): Unit =
+    validate(checkVertices = true, intermediateStorageLevel = StorageLevel.MEMORY_AND_DISK)
+
+  /**
+   * Validates the consistency and integrity of a graph by performing checks on the vertices and
+   * edges.
+   *
+   * @param checkVertices
+   *   whether to verify that all edge endpoints exist in the vertices dataset.
+   * @param intermediateStorageLevel
+   *   storage level used for intermediate datasets during validation.
+   * @throws InvalidGraphException
+   *   if there are any inconsistencies in the graph.
+   * @group utils
+   */
+  def validate(checkVertices: Boolean, intermediateStorageLevel: StorageLevel): Unit = {
+    import GraphDataset.*
+    val persistedVertices = vertices.select(col(ID_COL)).persist(intermediateStorageLevel)
+    try {
+      val countDistinctVertices =
+        persistedVertices.select(countDistinct(ID_COL)).first().getLong(0)
+      val verticesCount = persistedVertices.count()
+      if (countDistinctVertices != verticesCount) {
+        throw new InvalidGraphException(
+          s"Graph contains (${verticesCount - countDistinctVertices}) duplicate vertices.")
+      }
+      if (checkVertices) {
+        val verticesSetFromEdges = edges
+          .select(col(SRC_ID_COL).alias(ID_COL))
+          .union(edges.select(col(DST_ID_COL).alias(ID_COL)))
+          .distinct()
+          .persist(intermediateStorageLevel)
+        try {
+          val countVerticesFromEdges = verticesSetFromEdges.count()
+          if (countVerticesFromEdges > countDistinctVertices) {
+            throw new InvalidGraphException(
+              s"Graph is inconsistent: edges has $countVerticesFromEdges " +
+                s"vertices, but vertices has $countDistinctVertices vertices.")
+          }
+          val countOfBadVertices = verticesSetFromEdges
+            .join(persistedVertices, Seq(ID_COL), "left_anti")
+            .count()
+          if (countOfBadVertices > 0) {
+            throw new InvalidGraphException(
+              "Vertices Dataset does not contain all edges srcId/dstId. " +
+                s"Found $countOfBadVertices edges srcId/dstId that are not in the vertices Dataset.")
+          }
+        } finally {
+          val _ = verticesSetFromEdges.unpersist()
+        }
+      }
+    } finally {
+      val _ = persistedVertices.unpersist()
+    }
+  }
+
+  /**
+   * Converts the directed graph into an undirected graph by adding a reverse edge `(dstId, srcId,
+   * attr)` for every edge `(srcId, dstId, attr)`.
+   *
+   * Note: self-loops (`srcId == dstId`) are duplicated in the resulting edge dataset.
+   *
+   * @group utils
+   */
+  def asUndirected(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
+    val reversed = edges
+      .select(col(DST_ID_COL).alias(SRC_ID_COL), col(SRC_ID_COL).alias(DST_ID_COL), col(ATTR_COL))
+      .as[GraphEdge[ED]]
+    GraphDataset(vertices, edges.union(reversed))
+  }
+
+  /**
+   * Reverses the direction of all edges in the graph.
+   *
+   * @group utils
+   */
+  def asReversed(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
+    val reversed = edges
+      .select(col(DST_ID_COL).alias(SRC_ID_COL), col(SRC_ID_COL).alias(DST_ID_COL), col(ATTR_COL))
+      .as[GraphEdge[ED]]
+    GraphDataset(vertices, reversed)
+  }
+
+  // ============== Basic structural methods ============
+
+  /**
+   * The typed dataset representation of the vertices of the graph.
+   *
+   * @group structure
+   */
+  def vertices: Dataset[GraphVertex[VD]] = {
+    if (_vertices == null) {
+      throw new IllegalStateException(
+        "You cannot use GraphDataset objects within a Spark closure")
+    }
+    _vertices
+  }
+
+  /**
+   * The typed dataset representation of the edges of the graph.
+   *
+   * @group structure
+   */
+  def edges: Dataset[GraphEdge[ED]] = {
+    if (_edges == null) {
+      throw new IllegalStateException(
+        "You cannot use GraphDataset objects within a Spark closure")
+    }
+    _edges
+  }
+
+  /**
+   * Returns typed triplets `(src, edge, dst)` for all edges in the graph whose source and
+   * destination vertices exist in [[vertices]].
+   *
+   * @group structure
+   */
+  @transient lazy val triplets: Dataset[GraphTriplet[VD, ED]] = {
+    import GraphDataset.*
+    val srcV = vertices.toDF(SRC_ID_COL, SRC_ATTR_COL)
+    val dstV = vertices.toDF(DST_ID_COL, DST_ATTR_COL)
+    edges
+      .toDF(SRC_ID_COL, DST_ID_COL, ATTR_COL)
+      .join(srcV, Seq(SRC_ID_COL), "inner")
+      .join(dstV, Seq(DST_ID_COL), "inner")
+      .select(
+        col(SRC_ID_COL),
+        col(DST_ID_COL),
+        col(SRC_ATTR_COL),
+        col(DST_ATTR_COL),
+        col(ATTR_COL))
+      .as[GraphTriplet[VD, ED]]
+  }
+
+  // ============== Conversions ============
+
+  /**
+   * Converts this [[GraphDataset]] into an untyped [[GraphFrame]].
+   *
+   * The resulting vertices DataFrame has columns `id` and `attr`, and the edges DataFrame has
+   * columns `src`, `dst`, and `attr`.
+   *
+   * @group conversions
+   */
+  def toGraphFrame: GraphFrame = {
+    val vDF = vertices.toDF(GraphFrame.ID, GraphFrame.ATTR)
+    val eDF = edges.toDF(GraphFrame.SRC, GraphFrame.DST, GraphFrame.ATTR)
+    GraphFrame(vDF, eDF)
+  }
+
+  /**
+   * Converts this [[GraphDataset]] into a strongly typed GraphX `Graph[VD, ED]`.
+   *
+   * @group conversions
+   */
+  def toGraphX(implicit vdCt: ClassTag[VD], edCt: ClassTag[ED]): Graph[VD, ED] = {
+    val vRDD = vertices.rdd.map(v => (v.id, v.attr))
+    val eRDD = edges.rdd.map(e => Edge(e.srcId, e.dstId, e.attr))
+    Graph[VD, ED](vRDD, eRDD)
+  }
+
+  // ============== Degree metrics ============
+
+  /**
+   * The out-degree of each vertex in the graph. Vertices with 0 out-edges are not returned.
+   *
+   * @group degree
+   */
+  @transient lazy val outDegrees: Dataset[(VertexId, Int)] = {
+    val session = spark
+    import session.implicits.*
+    edges
+      .groupBy(col(GraphDataset.SRC_ID_COL))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
+  }
+
+  /**
+   * The in-degree of each vertex in the graph. Vertices with 0 in-edges are not returned.
+   *
+   * @group degree
+   */
+  @transient lazy val inDegrees: Dataset[(VertexId, Int)] = {
+    val session = spark
+    import session.implicits.*
+    edges
+      .groupBy(col(GraphDataset.DST_ID_COL))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
+  }
+
+  /**
+   * The total degree (in + out) of each vertex in the graph. Vertices with 0 edges are not
+   * returned.
+   *
+   * @group degree
+   */
+  @transient lazy val degrees: Dataset[(VertexId, Int)] = {
+    val session = spark
+    import session.implicits.*
+    import GraphDataset.*
+    edges
+      .select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
+      .groupBy(col(ID_COL))
+      .agg(count("*").cast("int"))
+      .as[(VertexId, Int)]
+  }
+
+  /**
+   * The out-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
+   *
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeOutDegree[K: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    val pairs: Dataset[TypedDegreePair[K]] =
+      edges.map(e => TypedDegreePair(e.srcId, edgeType(e.attr)))
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
+  /**
+   * The in-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
+   *
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeInDegree[K: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    val pairs: Dataset[TypedDegreePair[K]] =
+      edges.map(e => TypedDegreePair(e.dstId, edgeType(e.attr)))
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
+  /**
+   * The total degree (in + out) of each vertex grouped by a typed edge category extracted via
+   * `edgeType`.
+   *
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
+   *
+   * @group degree
+   */
+  def typeDegree[K: TypeTag](
+      edgeType: ED => K,
+      edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
+    val pairs: Dataset[TypedDegreePair[K]] = edges.flatMap { e =>
+      val k = edgeType(e.attr)
+      Iterator(TypedDegreePair(e.srcId, k), TypedDegreePair(e.dstId, k))
+    }
+    TypedDegreeMetrics.compute(pairs, edgeTypes)
+  }
+
+  // ============== Subgraph selection and transformations ============
+
+  /**
+   * Filter the vertices according to a typed predicate, removing edges containing any dropped
+   * vertices.
+   *
+   * @group subgraph
+   */
+  def filterVertices(condition: GraphVertex[VD] => Boolean): GraphDataset[VD, ED] = {
+    import GraphDataset.*
+    val vv: Dataset[GraphVertex[VD]] = vertices.filter(condition)
+    val vvIds = vv.select(col(ID_COL))
+    val ee: Dataset[GraphEdge[ED]] = edges
+      .join(vvIds, col(SRC_ID_COL) === vvIds(ID_COL), "left_semi")
+      .join(vvIds, col(DST_ID_COL) === vvIds(ID_COL), "left_semi")
+      .as[GraphEdge[ED]]
+    GraphDataset(vv, ee)
+  }
+
+  /**
+   * Filter the edges according to a typed predicate, keeping all vertices.
+   *
+   * @group subgraph
+   */
+  def filterEdges(condition: GraphEdge[ED] => Boolean): GraphDataset[VD, ED] = {
+    val ee: Dataset[GraphEdge[ED]] = edges.filter(condition)
+    GraphDataset(vertices, ee)
+  }
+
+  /**
+   * Restrict the graph to only the vertices and edges satisfying the predicates. Edges whose
+   * source or destination vertices do not satisfy `vpred` are also removed.
+   *
+   * @group subgraph
+   */
+  def subgraph(
+      epred: GraphEdge[ED] => Boolean = _ => true,
+      vpred: GraphVertex[VD] => Boolean = _ => true): GraphDataset[VD, ED] = {
+    filterEdges(epred).filterVertices(vpred)
+  }
+
+  /**
+   * Drop isolated vertices (vertices not incident to any edge).
+   *
+   * @group subgraph
+   */
+  def dropIsolatedVertices(): GraphDataset[VD, ED] = {
+    import GraphDataset.*
+    val ee: Dataset[GraphEdge[ED]] = edges
+    val activeIds = ee.select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
+    val vv: Dataset[GraphVertex[VD]] = vertices
+      .join(activeIds, Seq(ID_COL), "left_semi")
+      .as[GraphVertex[VD]]
+    GraphDataset(vv, ee)
+  }
+
+  /**
+   * Transform each vertex attribute using the given function.
+   *
+   * @group subgraph
+   */
+  def mapVertices[VD2: TypeTag](f: (VertexId, VD) => VD2): GraphDataset[VD2, ED] = {
+    val vv: Dataset[GraphVertex[VD2]] = vertices.map(v => GraphVertex(v.id, f(v.id, v.attr)))
+    GraphDataset(vv, edges)
+  }
+
+  /**
+   * Transform each edge attribute using the given function.
+   *
+   * @group subgraph
+   */
+  def mapEdges[ED2: TypeTag](f: GraphEdge[ED] => ED2): GraphDataset[VD, ED2] = {
+    val ee: Dataset[GraphEdge[ED2]] = edges.map(e => GraphEdge(e.srcId, e.dstId, f(e)))
+    GraphDataset(vertices, ee)
+  }
+
+  /**
+   * Transform each edge attribute using the full triplet (source vertex, edge, destination
+   * vertex).
+   *
+   * Note: because this operates over [[triplets]], edges whose source or destination vertex is
+   * absent from [[vertices]] are omitted.
+   *
+   * @group subgraph
+   */
+  def mapTriplets[ED2: TypeTag](f: GraphTriplet[VD, ED] => ED2): GraphDataset[VD, ED2] = {
+    val ee: Dataset[GraphEdge[ED2]] = triplets.map(t => GraphEdge(t.srcId, t.dstId, f(t)))
+    GraphDataset(vertices, ee)
+  }
+
+  // ============== Standard graph algorithms ============
+
+  /**
+   * Typed Breadth-First Search (BFS) finding shortest paths between vertices matching typed
+   * predicates.
+   *
+   * See [[org.graphframes.dataset.lib.BFSDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def bfs: BFSDataset[VD, ED] =
+    new BFSDataset[VD, ED](this)
+
+  /**
+   * Typed AllPaths algorithm enumerating all simple paths between vertices matching typed
+   * predicates.
+   *
+   * See [[org.graphframes.dataset.lib.AllPathsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def allPaths: AllPathsDataset[VD, ED] =
+    new AllPathsDataset[VD, ED](this)
+
+  /**
+   * Typed multi-hop neighbor traversal and accumulation.
+   *
+   * See [[org.graphframes.dataset.lib.AggregateNeighborsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def aggregateNeighbors: AggregateNeighborsDataset[VD, ED] =
+    new AggregateNeighborsDataset[VD, ED](this)
+
+  /**
+   * Typed message aggregation builder for sending and aggregating messages across graph triplets.
+   *
+   * See [[org.graphframes.dataset.lib.AggregateMessagesDataset]] for more details.
+   *
+   * @tparam M
+   *   the message type
+   * @group stdlib
+   */
+  def aggregateMessages[M: Encoder]: AggregateMessagesDataset[VD, ED, M] =
+    new AggregateMessagesDataset[VD, ED, M](this)
+
+  /**
+   * Connected components algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.ConnectedComponentsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def connectedComponents: ConnectedComponentsDataset[VD, ED] =
+    new ConnectedComponentsDataset[VD, ED](this)
+
+  /**
+   * Typed Pregel algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.PregelGraphDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def pregel: PregelGraphDataset[VD, ED] =
+    new PregelGraphDataset[VD, ED](this)
+
+  /**
+   * PageRank algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.PageRankDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def pageRank: PageRankDataset[VD, ED] =
+    new PageRankDataset[VD, ED](this)
+
+  /**
+   * Shortest paths algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.ShortestPathsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def shortestPaths: ShortestPathsDataset[VD, ED] =
+    new ShortestPathsDataset[VD, ED](this)
+
+  /**
+   * Triangle count algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.TriangleCountDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def triangleCount: TriangleCountDataset[VD, ED] =
+    new TriangleCountDataset[VD, ED](this)
+
+  /**
+   * Label propagation algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.LabelPropagationDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def labelPropagation: LabelPropagationDataset[VD, ED] =
+    new LabelPropagationDataset[VD, ED](this)
+
+  /**
+   * Strongly connected components algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.StronglyConnectedComponentsDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def stronglyConnectedComponents: StronglyConnectedComponentsDataset[VD, ED] =
+    new StronglyConnectedComponentsDataset[VD, ED](this)
+
+  /**
+   * K-Core decomposition algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.KCoreDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def kCore: KCoreDataset[VD, ED] =
+    new KCoreDataset[VD, ED](this)
+
+  /**
+   * Maximal Independent Set algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.MaximalIndependentSetDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def maximalIndependentSet: MaximalIndependentSetDataset[VD, ED] =
+    new MaximalIndependentSetDataset[VD, ED](this)
+
+  /**
+   * Cycle detection algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.DetectingCyclesDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def detectingCycles: DetectingCyclesDataset[VD, ED] =
+    new DetectingCyclesDataset[VD, ED](this)
+
+  /**
+   * Parallel Personalized PageRank algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.ParallelPersonalizedPageRankDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def parallelPersonalizedPageRank: ParallelPersonalizedPageRankDataset[VD, ED] =
+    new ParallelPersonalizedPageRankDataset[VD, ED](this)
+
+  /**
+   * Structure-aware label propagation algorithm (requires Spark 4.1+).
+   *
+   * See [[org.graphframes.dataset.lib.StructureAwareLabelPropagationDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def structureAwareLabelPropagation: StructureAwareLabelPropagationDataset[VD, ED] =
+    new StructureAwareLabelPropagationDataset[VD, ED](this)
+
+  /**
+   * Approximate neighborhood function backed by HyperLogLog sketches.
+   *
+   * See [[org.graphframes.dataset.lib.HyperANFDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def hyperANF: HyperANFDataset[VD, ED] =
+    new HyperANFDataset[VD, ED](this)
+
+  /**
+   * Random-walk-based node embeddings.
+   *
+   * See [[org.graphframes.dataset.lib.RandomWalkEmbeddingsDataset]] for more details.
+   *
+   * @group gml
+   */
+  def randomWalksBasedEmbedding: RandomWalkEmbeddingsDataset[VD, ED] =
+    new RandomWalkEmbeddingsDataset[VD, ED](this)
+
+  /**
+   * SVD++ collaborative filtering algorithm.
+   *
+   * See [[org.graphframes.dataset.lib.SVDPlusPlusDataset]] for more details.
+   *
+   * @group stdlib
+   */
+  def svdPlusPlus: SVDPlusPlusDataset[VD, ED] =
+    new SVDPlusPlusDataset[VD, ED](this)
+
+  /**
+   * Power Iteration Clustering (PIC) algorithm.
+   *
+   * @param k
+   *   the number of clusters to create
+   * @param maxIter
+   *   maximum number of iterations
+   * @param weightExtractor
+   *   optional typed function extracting a non-negative similarity weight from each edge
+   *   attribute
+   * @return
+   *   a typed `Dataset[ClusterAssignment]` mapping each vertex ID to its assigned cluster
+   * @group stdlib
+   */
+  def powerIterationClustering(
+      k: Int,
+      maxIter: Int,
+      weightExtractor: Option[ED => Double] = None): Dataset[ClusterAssignment] = {
+    val session = spark
+    import session.implicits.*
+    import GraphDataset.*
+
+    val resDF = weightExtractor match {
+      case Some(extract) =>
+        val vDF = vertices.toDF(GraphFrame.ID, GraphFrame.ATTR)
+        val eDF = edges
+          .map(e => (e.srcId, e.dstId, extract(e.attr)))
+          .toDF(GraphFrame.SRC, GraphFrame.DST, PIC_WEIGHT_COL)
+        GraphFrame(vDF, eDF).powerIterationClustering(k, maxIter, Some(PIC_WEIGHT_COL))
+      case None =>
+        toGraphFrame.powerIterationClustering(k, maxIter, None)
+    }
+
+    resDF
+      .select(col(GraphFrame.ID).alias(ID_COL), col(CLUSTER_COL).cast("int").alias(CLUSTER_COL))
+      .as[ClusterAssignment]
+  }
+}
+
+object GraphDataset extends Serializable with Logging {
+
+  private val ID_COL = "id"
+  private val ATTR_COL = "attr"
+  private val SRC_ID_COL = "srcId"
+  private val DST_ID_COL = "dstId"
+  private val SRC_ATTR_COL = "srcAttr"
+  private val DST_ATTR_COL = "dstAttr"
+  private val CLUSTER_COL = "cluster"
+  private val PIC_WEIGHT_COL = "_gf_pic_weight"
+
+  /**
+   * Construct a [[GraphDataset]] from typed vertex and edge datasets.
+   */
+  def apply[VD: TypeTag, ED: TypeTag](
+      vertices: Dataset[GraphVertex[VD]],
+      edges: Dataset[GraphEdge[ED]]): GraphDataset[VD, ED] = {
+    new GraphDataset[VD, ED](vertices, edges)
+  }
+
+  /**
+   * Construct a [[GraphDataset]] from an edge dataset, inferring the vertex set from the distinct
+   * edge endpoints and assigning each vertex `defaultVertexAttribute`.
+   */
+  def fromEdges[VD: TypeTag, ED: TypeTag](
+      edges: Dataset[GraphEdge[ED]],
+      defaultVertexAttribute: VD): GraphDataset[VD, ED] = {
+    val session = edges.sparkSession
+    import session.implicits.*
+    val vertices: Dataset[GraphVertex[VD]] = edges
+      .select(explode(array(col(SRC_ID_COL), col(DST_ID_COL))).alias(ID_COL))
+      .distinct()
+      .as[VertexId]
+      .map((id: VertexId) => GraphVertex(id, defaultVertexAttribute))
+    apply(vertices, edges)
+  }
+
+  private def isIntegralType(dt: DataType): Boolean = dt match {
+    case ByteType | ShortType | IntegerType | LongType => true
+    case _ => false
+  }
+
+  /**
+   * Construct a [[GraphDataset]] from an existing [[GraphFrame]].
+   *
+   * The vertices DataFrame must contain an integral `id` column (`Byte`, `Short`, `Int`, or
+   * `Long`) and an `attr` column; the edges DataFrame must contain integral `src` and `dst`
+   * columns and an `attr` column.
+   *
+   * @throws org.graphframes.GraphFramesUnsupportedVertexTypeException
+   *   if vertex IDs or edge endpoints are not an integral SQL type
+   */
+  def fromGraphFrame[VD: TypeTag, ED: TypeTag](graph: GraphFrame): GraphDataset[VD, ED] = {
+    require(graph != null, "graph must not be null.")
+    val idType = graph.vertices.schema(GraphFrame.ID).dataType
+    if (!isIntegralType(idType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset vertex ID column '${GraphFrame.ID}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $idType.")
+    }
+    val srcType = graph.edges.schema(GraphFrame.SRC).dataType
+    if (!isIntegralType(srcType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset edge column '${GraphFrame.SRC}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $srcType.")
+    }
+    val dstType = graph.edges.schema(GraphFrame.DST).dataType
+    if (!isIntegralType(dstType)) {
+      throw new GraphFramesUnsupportedVertexTypeException(
+        s"GraphDataset edge column '${GraphFrame.DST}' must be an integral type " +
+          s"(Byte, Short, Int, Long), but found $dstType.")
+    }
+    require(
+      graph.vertices.columns.contains(GraphFrame.ATTR),
+      s"Vertex attribute column '${GraphFrame.ATTR}' is missing from GraphFrame.vertices " +
+        s"(columns: ${graph.vertices.columns.mkString(", ")}).")
+    require(
+      graph.edges.columns.contains(GraphFrame.ATTR),
+      s"Edge attribute column '${GraphFrame.ATTR}' is missing from GraphFrame.edges " +
+        s"(columns: ${graph.edges.columns.mkString(", ")}).")
+
+    val vv = graph.vertices
+      .select(col(GraphFrame.ID).cast("long").alias(ID_COL), col(GraphFrame.ATTR).alias(ATTR_COL))
+      .as[GraphVertex[VD]]
+    val ee = graph.edges
+      .select(
+        col(GraphFrame.SRC).cast("long").alias(SRC_ID_COL),
+        col(GraphFrame.DST).cast("long").alias(DST_ID_COL),
+        col(GraphFrame.ATTR).alias(ATTR_COL))
+      .as[GraphEdge[ED]]
+    apply(vv, ee)
+  }
+
+  /**
+   * Converts a GraphX `Graph[VD, ED]` into a strongly typed [[GraphDataset]].
+   *
+   * @group conversions
+   */
+  def fromGraphX[VD: TypeTag, ED: TypeTag](graph: Graph[VD, ED]): GraphDataset[VD, ED] = {
+    require(graph != null, "graph must not be null.")
+    val spark = SparkSession.getActiveSession.getOrElse(SparkSession.builder().getOrCreate())
+    val vv: Dataset[GraphVertex[VD]] =
+      spark.createDataset(graph.vertices.map { case (id, attr) => GraphVertex(id, attr) })
+    val ee: Dataset[GraphEdge[ED]] =
+      spark.createDataset(graph.edges.map(e => GraphEdge(e.srcId, e.dstId, e.attr)))
+    apply(vv, ee)
+  }
+}
