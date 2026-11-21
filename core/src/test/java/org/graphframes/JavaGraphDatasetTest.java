@@ -175,9 +175,9 @@ public class JavaGraphDatasetTest {
         new HashSet<>(rt.edges().collectAsList()), "round-trip edges");
 
     // fromEdges
-    JavaGraphDataset<String, EdgeBean> fromE = JavaGraphDataset.fromEdges(
+    JavaGraphDataset<String, EdgeBean> fromEdgesGraph = JavaGraphDataset.fromEdges(
         g.edges(), "default", Encoders.STRING(), Encoders.bean(EdgeBean.class));
-    assertEq(3L, fromE.vertices().count(), "fromEdges vertex count");
+    assertEq(3L, fromEdgesGraph.vertices().count(), "fromEdges vertex count");
 
     // Triplets
     List<Tuple5<Long, Long, PersonBean, PersonBean, EdgeBean>> triplets =
@@ -408,10 +408,10 @@ public class JavaGraphDatasetTest {
 
   public static void testReviewRegressionFixes(SparkSession spark) {
     // 1. fromGraphFrame rejects non-integral IDs and missing attr columns
-    Dataset<Row> validV = spark.createDataset(
+    Dataset<Row> validVertices = spark.createDataset(
         Collections.singletonList(new Tuple2<>(1L, "A")),
         Encoders.tuple(Encoders.LONG(), Encoders.STRING())).toDF("id", "attr");
-    Dataset<Row> validE = spark.createDataset(
+    Dataset<Row> validEdges = spark.createDataset(
         Collections.singletonList(new Tuple3<>(1L, 1L, "self")),
         Encoders.tuple(Encoders.LONG(), Encoders.LONG(), Encoders.STRING()))
         .toDF("src", "dst", "attr");
@@ -421,17 +421,17 @@ public class JavaGraphDatasetTest {
     boolean rejectedStr = false;
     try {
       JavaGraphDataset.fromGraphFrame(
-          GraphFrame.apply(strV, validE), Encoders.STRING(), Encoders.STRING());
+          GraphFrame.apply(strV, validEdges), Encoders.STRING(), Encoders.STRING());
     } catch (IllegalArgumentException expected) {
       rejectedStr = true;
     }
     assertEq(true, rejectedStr, "fromGraphFrame string id rejection");
 
-    Dataset<Row> noAttrV = validV.withColumnRenamed("attr", "other");
+    Dataset<Row> noAttrV = validVertices.withColumnRenamed("attr", "other");
     boolean rejectedAttr = false;
     try {
       JavaGraphDataset.fromGraphFrame(
-          GraphFrame.apply(noAttrV, validE), Encoders.STRING(), Encoders.STRING());
+          GraphFrame.apply(noAttrV, validEdges), Encoders.STRING(), Encoders.STRING());
     } catch (IllegalArgumentException expected) {
       rejectedAttr = true;
     }
@@ -549,7 +549,7 @@ public class JavaGraphDatasetTest {
             g.mapVertices((id, p) -> id == 1L ? 1 : 0, Encoders.INT());
         pregelGraph.edges().cache();
         pregelGraph.edges().count();
-        JavaGraphDataset<Integer, EdgeBean> pRes = pregelGraph.pregel()
+        JavaGraphDataset<Integer, EdgeBean> pregelResult = pregelGraph.pregel()
             .setMaxIter(2)
             .setCheckpointInterval(0)
             .setJobDescriptionPrefix("JavaCustomPregel")
@@ -566,7 +566,7 @@ public class JavaGraphDatasetTest {
             "job description restored");
         assertEq(false, StorageLevel.NONE().equals(pregelGraph.edges().storageLevel()),
             "JavaPregel preserves cached edges");
-        pRes.vertices().unpersist(true);
+        pregelResult.vertices().unpersist(true);
         assertEq(false, StorageLevel.NONE().equals(pregelGraph.edges().storageLevel()),
             "unpersisting vertices preserves input cached edges");
         pregelGraph.edges().unpersist(true);

@@ -335,27 +335,27 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
   }
 
   test("fromGraphFrame rejects non-integral IDs and missing attr columns") {
-    val validV = spark.createDataFrame(Seq((1L, "A"), (2L, "B"))).toDF("id", "attr")
-    val validE = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "attr")
+    val validVertices = spark.createDataFrame(Seq((1L, "A"), (2L, "B"))).toDF("id", "attr")
+    val validEdges = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "attr")
 
     val strV = spark.createDataFrame(Seq(("1", "A"))).toDF("id", "attr")
     intercept[IllegalArgumentException] {
-      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(strV, validE))
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(strV, validEdges))
     }
 
     val dblE = spark.createDataFrame(Seq((1.0, 2.0, "know"))).toDF("src", "dst", "attr")
     intercept[IllegalArgumentException] {
-      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validV, dblE))
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validVertices, dblE))
     }
 
     val noAttrV = spark.createDataFrame(Seq((1L, "A"))).toDF("id", "name")
     intercept[IllegalArgumentException] {
-      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(noAttrV, validE))
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(noAttrV, validEdges))
     }
 
     val noAttrE = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "rel")
     intercept[IllegalArgumentException] {
-      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validV, noAttrE))
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validVertices, noAttrE))
     }
   }
 
