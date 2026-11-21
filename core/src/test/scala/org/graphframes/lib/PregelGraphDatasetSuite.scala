@@ -18,10 +18,13 @@
 package org.graphframes.lib
 
 import org.apache.spark.graphframes.graphx.EdgeDirection
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrameTestSparkContext
 import org.graphframes.SparkFunSuite
 import org.scalactic.Tolerance.*
+
+import java.io.IOException
 
 case class PathMsg(dist: Int, via: VertexId)
 case class NodeState(label: String, dist: Int)
@@ -256,5 +259,141 @@ class PregelGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkCont
         2L -> NodeState("mid", 4),
         3L -> NodeState("end", 10)))
     result.vertices.unpersist()
+  }
+
+  test("preserves pre-cached caller edges and unpersisting result vertices frees all caches") {
+    val vv =
+      spark.createDataset((1L to 4L).map(i => GraphVertex(i, if (i == 1L) 1 else 0))).cache()
+    val ee = spark.createDataset((1L until 4L).map(i => GraphEdge(i, i + 1L, 1))).cache()
+    val _ = (vv.count(), ee.count())
+    val beforeIds = sc.getPersistentRDDs.keySet
+    val g = GraphDataset(vv, ee)
+
+    try {
+      val result = g.pregel
+        .setMaxIter(10)
+        .setCheckpointInterval(0)
+        .setActiveDirection(EdgeDirection.Out)
+        .withMessages[Int](0)
+        .vprog((_, attr, msg) => math.max(attr, msg))
+        .sendMsgToDstOpt(t => if (t.srcAttr > t.dstAttr) Some(t.srcAttr) else None)
+        .mergeMsg(math.max)
+        .run()
+
+      assert(g.edges.storageLevel !== StorageLevel.NONE)
+      assert(result.vertices.storageLevel !== StorageLevel.NONE)
+      assert(result.vertices.collect().forall(_.attr == 1))
+
+      result.vertices.unpersist(blocking = true)
+      assert(g.edges.storageLevel !== StorageLevel.NONE)
+      assert((sc.getPersistentRDDs.keySet -- beforeIds).isEmpty)
+    } finally {
+      vv.unpersist(blocking = true)
+      ee.unpersist(blocking = true)
+    }
+  }
+
+  test("works with legacy nameNonStructGroupingKeyAsValue conf") {
+    val confKey = "spark.sql.legacy.dataset.nameNonStructGroupingKeyAsValue"
+    val prev = spark.conf.getOption(confKey)
+    spark.conf.set(confKey, "true")
+    try {
+      val vv = spark.createDataset(Seq(GraphVertex(1L, 10), GraphVertex(2L, 0)))
+      val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, 1)))
+      val g = GraphDataset(vv, ee)
+
+      val result = g.pregel
+        .setMaxIter(3)
+        .setCheckpointInterval(0)
+        .withMessages[Int](0)
+        .vprog((_, attr, msg) => math.max(attr, msg))
+        .sendMsgToDstOpt(t => if (t.srcAttr > t.dstAttr) Some(t.srcAttr) else None)
+        .mergeMsg(math.max)
+        .run()
+
+      val map = result.vertices.collect().map(v => v.id -> v.attr).toMap
+      assert(map === Map(1L -> 10, 2L -> 10))
+      result.vertices.unpersist(blocking = true)
+    } finally {
+      prev match {
+        case Some(v) => spark.conf.set(confKey, v)
+        case None => spark.conf.unset(confKey)
+      }
+    }
+  }
+
+  test("EdgeDirection.Either, maxIter cap, self-loops, parallel edges, and empty graph") {
+    val emptyV = spark.emptyDataset[GraphVertex[Int]]
+    val emptyE = spark.emptyDataset[GraphEdge[Int]]
+    val emptyRes = GraphDataset(emptyV, emptyE).pregel
+      .setMaxIter(3)
+      .setCheckpointInterval(0)
+      .withMessages[Int](0)
+      .vprog((_, attr, msg) => attr + msg)
+      .sendMsgToDst(_.srcAttr)
+      .mergeMsg(_ + _)
+      .run()
+    assert(emptyRes.vertices.isEmpty)
+    emptyRes.vertices.unpersist(blocking = true)
+
+    val vv = spark.createDataset(
+      Seq(GraphVertex(1L, 1), GraphVertex(2L, 0), GraphVertex(3L, 0), GraphVertex(4L, 0)))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 1L, 1),
+        GraphEdge(1L, 2L, 1),
+        GraphEdge(1L, 2L, 2),
+        GraphEdge(2L, 3L, 1),
+        GraphEdge(3L, 4L, 1)))
+    val g = GraphDataset(vv, ee)
+
+    // With EdgeDirection.Either and maxIter(2), signal from 1 reaches 2 and 3, stopping before 4
+    val capped = g.pregel
+      .setMaxIter(2)
+      .setCheckpointInterval(1)
+      .setUseLocalCheckpoints(true)
+      .setActiveDirection(EdgeDirection.Either)
+      .withMessages[Int](0)
+      .vprog((_, attr, msg) => math.max(attr, msg))
+      .sendMsgToDstOpt(t => if (t.srcAttr > t.dstAttr) Some(t.srcAttr) else None)
+      .mergeMsg(math.max)
+      .run()
+
+    val values = capped.vertices.collect().map(v => v.id -> v.attr).toMap
+    assert(values === Map(1L -> 1, 2L -> 1, 3L -> 1, 4L -> 0))
+    capped.vertices.unpersist(blocking = true)
+  }
+
+  test("parameter validation and missing checkpointDir error") {
+    val vv = spark.createDataset(Seq(GraphVertex(1L, 1)))
+    val ee = spark.emptyDataset[GraphEdge[Int]]
+    val g = GraphDataset(vv, ee)
+
+    intercept[IllegalArgumentException] {
+      val _ = g.pregel.setCheckpointInterval(-1)
+    }
+    intercept[IllegalArgumentException] {
+      val _ = g.pregel.setActiveDirection(null)
+    }
+
+    val prevDir = sc.getCheckpointDir
+    val prevConf = spark.conf.getOption("spark.checkpoint.dir")
+    sc.setCheckpointDir(null)
+    spark.conf.unset("spark.checkpoint.dir")
+    try {
+      intercept[IOException] {
+        val _ = g.pregel
+          .setCheckpointInterval(1)
+          .setUseLocalCheckpoints(false)
+          .withMessages[Int](0)
+          .vprog((_, attr, _) => attr)
+          .sendMsgToDst(_.srcAttr)
+          .mergeMsg(_ + _)
+          .run()
+      }
+    } finally {
+      prevConf.foreach(spark.conf.set("spark.checkpoint.dir", _))
+      prevDir.foreach(sc.setCheckpointDir)
+    }
   }
 }

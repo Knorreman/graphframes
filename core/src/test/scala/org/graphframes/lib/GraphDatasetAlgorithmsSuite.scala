@@ -20,6 +20,7 @@ package org.graphframes.lib
 import org.apache.commons.io.FileUtils
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.functions.hll_sketch_estimate
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrameTestSparkContext
 import org.graphframes.GraphFramesSparkVersionException
@@ -417,5 +418,150 @@ class GraphDatasetAlgorithmsSuite extends SparkFunSuite with GraphFrameTestSpark
         1L -> Map("friend" -> 2, "follow" -> 1),
         2L -> Map("friend" -> 3),
         3L -> Map("friend" -> 1, "follow" -> 1)))
+  }
+
+  test("labelPropagation graphframes algorithm handles isolated vertices") {
+    val vv = spark.createDataset((1L to 4L).map(i => GraphVertex(i, s"v$i")))
+    val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, 1), GraphEdge(2L, 1L, 1)))
+    val g = GraphDataset(vv, ee)
+
+    val lp = g.labelPropagation
+      .setAlgorithm("graphframes")
+      .setUseLocalCheckpoints(true)
+      .maxIter(3)
+      .run()
+    try {
+      val map = lp.collect().map(r => r.id -> r.label).toMap
+      assert(map.keySet === Set(1L, 2L, 3L, 4L))
+      assert(map(3L) === 3L)
+      assert(map(4L) === 4L)
+    } finally {
+      val _ = lp.unpersist(blocking = true)
+    }
+  }
+
+  test("type*Degree ignores null categories, works without Encoder implicit, and handles empty") {
+    val vv = spark.createDataset((1L to 3L).map(i => GraphVertex(i, i)))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, null.asInstanceOf[String]),
+        GraphEdge(1L, 3L, "friend"),
+        GraphEdge(2L, 3L, "other")))
+    val g = GraphDataset(vv, ee)
+
+    val outNone =
+      g.typeOutDegree(_.asInstanceOf[String]).collect().map(r => r.id -> r.degrees).toMap
+    assert(outNone === Map(1L -> Map("friend" -> 1), 2L -> Map("other" -> 1)))
+
+    val outFiltered = g
+      .typeOutDegree(_.asInstanceOf[String], edgeTypes = Some(Seq("friend", "follow")))
+      .collect()
+      .map(r => r.id -> r.degrees)
+      .toMap
+    assert(
+      outFiltered === Map(
+        1L -> Map("friend" -> 1, "follow" -> 0),
+        2L -> Map("friend" -> 0, "follow" -> 0)))
+
+    val emptyG =
+      GraphDataset(spark.emptyDataset[GraphVertex[Int]], spark.emptyDataset[GraphEdge[String]])
+    assert(emptyG.typeOutDegree(_.toString).isEmpty)
+  }
+
+  test("wrapped algorithms release raw caches and PageRank supports tol & sourceId") {
+    // Verify DatasetCacheUtils directly releases raw DataFrame cache while persisting typed output
+    val rawDF = spark
+      .createDataFrame(Seq((1L, 10L), (2L, 20L)))
+      .toDF("id", "label")
+      .persist(StorageLevel.MEMORY_AND_DISK)
+    assert(rawDF.count() === 2L)
+    assert(rawDF.storageLevel !== StorageLevel.NONE)
+    val typedDS = rawDF.select(col("id"), col("label")).as[LabelPropagationResult]
+    val cachedOut =
+      DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typedDS, StorageLevel.MEMORY_AND_DISK)
+    assert(rawDF.storageLevel === StorageLevel.NONE)
+    assert(cachedOut.storageLevel !== StorageLevel.NONE)
+    assert(cachedOut.collect().map(r => r.id -> r.label).toMap === Map(1L -> 10L, 2L -> 20L))
+    cachedOut.unpersist(blocking = true)
+    assert(cachedOut.storageLevel === StorageLevel.NONE)
+
+    val vv = spark.createDataset((1L to 4L).map(i => GraphVertex(i, s"v$i"))).cache()
+    val ee = spark
+      .createDataset(Seq(GraphEdge(1L, 2L, 1), GraphEdge(2L, 3L, 1), GraphEdge(3L, 1L, 1)))
+      .cache()
+    assert(vv.count() === 4L)
+    assert(ee.count() === 3L)
+    val g = GraphDataset(vv, ee)
+
+    try {
+      // Pure DataFrame algorithms should leave zero non-checkpointed persistent RDDs after blocking unpersist
+      var beforeIds = sc.getPersistentRDDs.keySet
+      def assertNoLeaks(step: String): Unit = {
+        val leaked = sc.getPersistentRDDs.filter { case (id, rdd) =>
+          !beforeIds.contains(id) && !rdd.isCheckpointed
+        }
+        assert(
+          leaked.isEmpty,
+          s"Unexpected persistent RDDs after $step: ${leaked.values.map(_.name).mkString(", ")}")
+        ()
+      }
+
+      val kc = g.kCore.setUseLocalCheckpoints(false).run()
+      assert(kc.storageLevel !== StorageLevel.NONE)
+      kc.unpersist(blocking = true)
+      assertNoLeaks("kCore")
+
+      val tc = g.triangleCount.run()
+      assert(tc.storageLevel !== StorageLevel.NONE)
+      tc.unpersist(blocking = true)
+      assertNoLeaks("triangleCount")
+
+      val spGf = g.shortestPaths
+        .landmarks(Seq(1L))
+        .setAlgorithm("graphframes")
+        .setUseLocalCheckpoints(false)
+        .run()
+      assert(spGf.storageLevel !== StorageLevel.NONE)
+      spGf.unpersist(blocking = true)
+      assertNoLeaks("shortestPaths")
+
+      // MaximalIndependentSet upstream caches internal intermediate DataFrames before returning raw DF;
+      // verify our typed wrapper dataset itself is persisted and cleanly unpersists, then re-baseline.
+      val mis = g.maximalIndependentSet.setUseLocalCheckpoints(false).run(42L)
+      assert(mis.storageLevel !== StorageLevel.NONE)
+      mis.unpersist(blocking = true)
+      assert(mis.storageLevel === StorageLevel.NONE)
+      beforeIds = sc.getPersistentRDDs.keySet
+
+      val dc = g.detectingCycles.setUseLocalCheckpoints(false).run()
+      assert(dc.storageLevel !== StorageLevel.NONE)
+      dc.unpersist(blocking = true)
+      assertNoLeaks("detectingCycles")
+
+      // PageRank with tol and sourceId
+      val ppr = g.pageRank.sourceId(1L).tol(0.01).run()
+      assert(ppr.vertices.storageLevel !== StorageLevel.NONE)
+      assert(ppr.edges.storageLevel !== StorageLevel.NONE)
+      val scores = ppr.vertices.collect().map(v => v.id -> v.attr.pagerank).toMap
+      assert(scores(1L) > scores(4L))
+      ppr.unpersist(blocking = true)
+      assert(ppr.vertices.storageLevel === StorageLevel.NONE)
+      assert(ppr.edges.storageLevel === StorageLevel.NONE)
+    } finally {
+      vv.unpersist(blocking = true)
+      ee.unpersist(blocking = true)
+      ()
+    }
+  }
+
+  test("RandomWalkEmbeddings validation and HyperANFResult numHops guard") {
+    val vv = spark.createDataset(Seq(GraphVertex(1L, "a")))
+    val ee = spark.emptyDataset[GraphEdge[Int]]
+    val g = GraphDataset(vv, ee)
+
+    intercept[IllegalArgumentException] {
+      val _ = g.randomWalksBasedEmbedding.run()
+    }
+    assert(HyperANFResult(1L, Seq.empty).numHops === 0)
   }
 }

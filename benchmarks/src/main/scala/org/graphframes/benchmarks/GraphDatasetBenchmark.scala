@@ -146,6 +146,7 @@ class GraphDatasetBenchmark extends LDBCBenchmarkBase {
           .setMaxIter(maxIter)
           .setCheckpointInterval(2)
           .setUseLocalCheckpoints(useLocalCheckpoints.toBoolean)
+          .setEarlyStopping(true)
           .withVertexColumn(
             "max_val",
             col("id").cast("long"),
@@ -164,6 +165,7 @@ class GraphDatasetBenchmark extends LDBCBenchmarkBase {
             t => if (t.srcAttr > t.dstAttr) Iterator((t.dstId, t.srcAttr)) else Iterator.empty,
           mergeMsg = math.max)
         val res = result.vertices.count()
+        result.unpersist()
         blackhole.consume(res)
     }
   }

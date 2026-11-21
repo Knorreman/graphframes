@@ -19,8 +19,12 @@ package org.graphframes;
 
 import org.apache.spark.graphframes.graphx.EdgeDirection;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.expressions.Aggregator;
+import org.apache.spark.storage.StorageLevel;
 import org.graphframes.lib.ClusterAssignment;
 import org.graphframes.lib.ConnectedComponentResult;
 import org.graphframes.lib.KCoreResult;
@@ -33,9 +37,10 @@ import scala.Tuple2;
 import scala.Tuple3;
 import scala.Tuple5;
 
-import java.io.IOException;
 import java.io.Serializable;
+import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -211,7 +216,39 @@ public class JavaGraphDatasetTest {
     assertEq(3L, g.asReversed().edges().count(), "asReversed");
   }
 
-  public static void testAggregateMessagesAndPregel(SparkSession spark) throws IOException {
+  public static class SumAggregator extends Aggregator<Integer, Long, Long> {
+    @Override
+    public Long zero() {
+      return 0L;
+    }
+
+    @Override
+    public Long reduce(Long b, Integer a) {
+      return b + a;
+    }
+
+    @Override
+    public Long merge(Long b1, Long b2) {
+      return b1 + b2;
+    }
+
+    @Override
+    public Long finish(Long reduction) {
+      return reduction;
+    }
+
+    @Override
+    public Encoder<Long> bufferEncoder() {
+      return Encoders.LONG();
+    }
+
+    @Override
+    public Encoder<Long> outputEncoder() {
+      return Encoders.LONG();
+    }
+  }
+
+  public static void testAggregateMessagesAndPregel(SparkSession spark) {
     JavaGraphDataset<PersonBean, EdgeBean> g = sampleGraph(spark);
 
     // AggregateMessages with sendToDst + sendToSrcOpt
@@ -367,5 +404,228 @@ public class JavaGraphDatasetTest {
         .map(ClusterAssignment::id)
         .collect(Collectors.toSet());
     assertEq(new HashSet<>(Arrays.asList(1L, 2L, 3L)), picIds, "PIC vertex IDs");
+  }
+
+  public static void testReviewRegressionFixes(SparkSession spark) {
+    // 1. fromGraphFrame rejects non-integral IDs and missing attr columns
+    Dataset<Row> validV = spark.createDataset(
+        Collections.singletonList(new Tuple2<>(1L, "A")),
+        Encoders.tuple(Encoders.LONG(), Encoders.STRING())).toDF("id", "attr");
+    Dataset<Row> validE = spark.createDataset(
+        Collections.singletonList(new Tuple3<>(1L, 1L, "self")),
+        Encoders.tuple(Encoders.LONG(), Encoders.LONG(), Encoders.STRING()))
+        .toDF("src", "dst", "attr");
+    Dataset<Row> strV = spark.createDataset(
+        Collections.singletonList(new Tuple2<>("1", "A")),
+        Encoders.tuple(Encoders.STRING(), Encoders.STRING())).toDF("id", "attr");
+    boolean rejectedStr = false;
+    try {
+      JavaGraphDataset.fromGraphFrame(
+          GraphFrame.apply(strV, validE), Encoders.STRING(), Encoders.STRING());
+    } catch (IllegalArgumentException expected) {
+      rejectedStr = true;
+    }
+    assertEq(true, rejectedStr, "fromGraphFrame string id rejection");
+
+    Dataset<Row> noAttrV = validV.withColumnRenamed("attr", "other");
+    boolean rejectedAttr = false;
+    try {
+      JavaGraphDataset.fromGraphFrame(
+          GraphFrame.apply(noAttrV, validE), Encoders.STRING(), Encoders.STRING());
+    } catch (IllegalArgumentException expected) {
+      rejectedAttr = true;
+    }
+    assertEq(true, rejectedAttr, "fromGraphFrame missing attr rejection");
+
+    // 2. JavaAggregator, JavaBFS 0-hop/no-path/edgeFilter/validation, JavaAllPaths validation
+    JavaGraphDataset<PersonBean, EdgeBean> g = sampleGraph(spark);
+    g.cache();
+    g.vertices().count();
+    g.edges().count();
+    try {
+      g.validate();
+      assertEq(false, StorageLevel.NONE().equals(g.vertices().storageLevel()),
+          "validate keeps cached vertices");
+
+      Map<Long, Long> customAgg = new HashMap<>();
+      for (Tuple2<Long, Long> r : g.aggregateMessages(Encoders.INT())
+          .sendToDst(t -> t.srcAttr().getAge())
+          .agg(new SumAggregator())
+          .collectAsList()) {
+        customAgg.put(r._1(), r._2());
+      }
+      assertEq(30L, customAgg.get(2L), "Aggregator agg for vertex 2");
+
+      List<SimplePath> zeroHop = g.bfs()
+          .fromPred(v -> v.id() == 1L)
+          .toPred(v -> v.id() == 1L)
+          .run()
+          .collectAsList();
+      assertEq(1, zeroHop.size(), "JavaBFS 0-hop count");
+      assertEq(Arrays.asList(1L), zeroHop.get(0).pathAsJava(), "SimplePath.pathAsJava");
+
+      List<SimplePath> noPath = g.bfs()
+          .fromPred(v -> v.id() == 1L)
+          .toPred(v -> v.id() == 4L)
+          .edgeFilter(e -> "friend".equals(e.attr().getKind()))
+          .maxPathLength(3)
+          .run()
+          .collectAsList();
+      assertEq(0, noPath.size(), "JavaBFS no-path count");
+
+      // JavaBFS & JavaAllPaths eager maxPathLength validation
+      boolean caughtBfsLen = false;
+      try {
+        g.bfs().maxPathLength(-1);
+      } catch (IllegalArgumentException expected) {
+        caughtBfsLen = true;
+      }
+      assertEq(true, caughtBfsLen, "JavaBFS rejects maxPathLength < 0");
+
+      boolean caughtApLen = false;
+      try {
+        g.allPaths().maxPathLength(0);
+      } catch (IllegalArgumentException expected) {
+        caughtApLen = true;
+      }
+      assertEq(true, caughtApLen, "JavaAllPaths rejects maxPathLength <= 0");
+
+      // Java collection helpers on ShortestPathsResult & SVDPlusPlusResult
+      Dataset<ShortestPathsResult> spDs = g.shortestPaths()
+          .landmarks(Collections.singletonList(3L))
+          .setAlgorithm("graphframes")
+          .setUseLocalCheckpoints(true)
+          .run();
+      List<ShortestPathsResult> spGf = spDs.collectAsList();
+      spDs.unpersist(true);
+      assertEq(4, spGf.size(), "JavaShortestPaths graphframes count");
+      Map<Long, Integer> d1 = spGf.stream()
+          .filter(r -> r.id() == 1L)
+          .findFirst()
+          .orElseThrow(AssertionError::new)
+          .distancesAsJava();
+      assertEq(2, d1.get(3L), "distancesAsJava distance to 3");
+
+      // JavaLabelPropagation graphframes algorithm with isolated vertex 4
+      Dataset<LabelPropagationResult> lpDs = g.labelPropagation()
+          .setAlgorithm("graphframes")
+          .setUseLocalCheckpoints(true)
+          .maxIter(3)
+          .run();
+      List<LabelPropagationResult> lpGf = lpDs.collectAsList();
+      lpDs.unpersist(true);
+      assertEq(4, lpGf.size(), "JavaLabelPropagation graphframes count");
+      long isolatedLabel = lpGf.stream()
+          .filter(r -> r.id() == 4L)
+          .findFirst()
+          .orElseThrow(AssertionError::new)
+          .label();
+      assertEq(4L, isolatedLabel, "isolated vertex keeps own ID label");
+
+      // JavaConnectedComponents respects GraphFramesConf
+      String algoKey = "spark.graphframes.connectedComponents.algorithm";
+      scala.Option<String> prevAlgo = spark.conf().getOption(algoKey);
+      spark.conf().set(algoKey, "randomized_contraction");
+      try {
+        Dataset<ConnectedComponentResult> ccRes =
+            g.connectedComponents().setUseLocalCheckpoints(true).run();
+        assertEq(4L, ccRes.count(), "JavaConnectedComponents with GraphFramesConf");
+        ccRes.unpersist(true);
+      } finally {
+        if (prevAlgo.isDefined()) {
+          spark.conf().set(algoKey, prevAlgo.get());
+        } else {
+          spark.conf().unset(algoKey);
+        }
+      }
+
+      // JavaPregel preserves cached edges, restores job description, throws UncheckedIOException
+      String confKey = "spark.sql.legacy.dataset.nameNonStructGroupingKeyAsValue";
+      scala.Option<String> prevKeyConf = spark.conf().getOption(confKey);
+      spark.conf().set(confKey, "true");
+      spark.sparkContext().setJobDescription("caller-java-job");
+      try {
+        JavaGraphDataset<Integer, EdgeBean> pregelGraph =
+            g.mapVertices((id, p) -> id == 1L ? 1 : 0, Encoders.INT());
+        pregelGraph.edges().cache();
+        pregelGraph.edges().count();
+        JavaGraphDataset<Integer, EdgeBean> pRes = pregelGraph.pregel()
+            .setMaxIter(2)
+            .setCheckpointInterval(0)
+            .setJobDescriptionPrefix("JavaCustomPregel")
+            .setActiveDirection(EdgeDirection.Either())
+            .withMessages(0, Encoders.INT())
+            .vprog((id, attr, msg) -> Math.max(attr, msg))
+            .sendMsgToDstOpt(t -> t.srcAttr() > t.dstAttr()
+                ? Optional.of(t.srcAttr())
+                : Optional.empty())
+            .mergeMsg(Math::max)
+            .run();
+        assertEq("caller-java-job",
+            spark.sparkContext().getLocalProperty("spark.job.description"),
+            "job description restored");
+        assertEq(false, StorageLevel.NONE().equals(pregelGraph.edges().storageLevel()),
+            "JavaPregel preserves cached edges");
+        pRes.vertices().unpersist(true);
+        assertEq(false, StorageLevel.NONE().equals(pregelGraph.edges().storageLevel()),
+            "unpersisting vertices preserves input cached edges");
+        pregelGraph.edges().unpersist(true);
+      } finally {
+        spark.sparkContext().setJobDescription(null);
+        if (prevKeyConf.isDefined()) {
+          spark.conf().set(confKey, prevKeyConf.get());
+        } else {
+          spark.conf().unset(confKey);
+        }
+      }
+
+      // Missing checkpoint dir throws UncheckedIOException in JavaPregel
+      scala.Option<String> prevDir = spark.sparkContext().getCheckpointDir();
+      scala.Option<String> prevCkptConf = spark.conf().getOption("spark.checkpoint.dir");
+      spark.sparkContext().setCheckpointDir(null);
+      spark.conf().unset("spark.checkpoint.dir");
+      boolean caughtUnchecked = false;
+      try {
+        g.mapVertices((id, p) -> 0, Encoders.INT())
+            .pregel()
+            .setCheckpointInterval(1)
+            .setUseLocalCheckpoints(false)
+            .withMessages(0, Encoders.INT())
+            .vprog((id, attr, msg) -> attr)
+            .sendMsgToDst(t -> t.srcAttr())
+            .mergeMsg(Integer::sum)
+            .run();
+      } catch (UncheckedIOException expected) {
+        caughtUnchecked = true;
+      } finally {
+        if (prevCkptConf.isDefined()) {
+          spark.conf().set("spark.checkpoint.dir", prevCkptConf.get());
+        }
+        if (prevDir.isDefined()) {
+          spark.sparkContext().setCheckpointDir(prevDir.get());
+        }
+      }
+      assertEq(true, caughtUnchecked, "JavaPregel throws UncheckedIOException without ckptDir");
+
+      // SVD++ Java list accessors & empty graph / self-loop checks
+      Tuple2<Dataset<SVDPlusPlusResult>, Double> svd =
+          g.svdPlusPlus().rank(4).maxIter(2).run(EdgeBean::getWeight);
+      SVDPlusPlusResult firstSvd = svd._1().first();
+      assertEq(4, firstSvd.column1AsJava().size(), "column1AsJava size");
+      assertEq(4, firstSvd.column2AsJava().size(), "column2AsJava size");
+      svd._1().unpersist(true);
+
+      JavaGraphDataset<Integer, Integer> emptyJava = JavaGraphDataset.of(
+          spark.emptyDataset(Encoders.tuple(Encoders.LONG(), Encoders.INT())),
+          spark.emptyDataset(Encoders.tuple(Encoders.LONG(), Encoders.LONG(), Encoders.INT())),
+          Encoders.INT(),
+          Encoders.INT());
+      assertEq(0L, emptyJava.degrees().count(), "empty Java graph degrees");
+
+      // JavaTriangleCount setLgNomEntries validation & chaining check
+      g.triangleCount().setLgNomEntries(8);
+    } finally {
+      g.unpersist(true);
+    }
   }
 }

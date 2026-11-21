@@ -21,6 +21,8 @@ import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.graphframes.GraphFramesConf
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrame
 import org.graphframes.Logging
@@ -34,7 +36,10 @@ import org.graphframes.WithMaxIter
  * Connected Components algorithm for [[org.graphframes.GraphDataset]].
  *
  * Wraps [[ConnectedComponents]] on the underlying [[GraphFrame]] representation and returns a
- * typed `Dataset[ConnectedComponentResult]` assigning each vertex to its connected component ID.
+ * persisted and materialized `Dataset[ConnectedComponentResult]` assigning each vertex to its
+ * connected component ID. Callers should call `.unpersist()` on the returned dataset when it is
+ * no longer needed. Unset configuration parameters fall back to `spark.graphframes.*` SQL
+ * configurations via `GraphFramesConf`.
  */
 class ConnectedComponentsDataset[VD, ED] private[graphframes] (
     private val graph: GraphDataset[VD, ED])
@@ -46,38 +51,90 @@ class ConnectedComponentsDataset[VD, ED] private[graphframes] (
     with WithLocalCheckpoints
     with WithMaxIter {
 
-  private var algorithm: String = ConnectedComponents.ALGO_TWO_PHASE
+  private var algorithmOpt: Option[String] = None
+  private var broadcastThresholdOpt: Option[Int] = None
+  private var checkpointIntervalOpt: Option[Int] = None
+  private var intermediateStorageLevelOpt: Option[StorageLevel] = None
+  private var useLocalCheckpointsOpt: Option[Boolean] = None
 
   /**
    * Sets the algorithm to use for computing connected components. Supported values match
    * [[ConnectedComponents.setAlgorithm]] (`"two_phase"`, `"randomized_contraction"`, `"graphx"`).
    */
   def setAlgorithm(value: String): this.type = {
-    algorithm = value
+    algorithmOpt = Some(value)
     this
   }
 
   /** Gets the algorithm used for computing connected components. */
-  def getAlgorithm: String = algorithm
+  def getAlgorithm: String =
+    algorithmOpt
+      .orElse(GraphFramesConf.getConnectedComponentsAlgorithm)
+      .getOrElse(ConnectedComponents.ALGO_TWO_PHASE)
+
+  override def setBroadcastThreshold(value: Int): this.type = {
+    broadcastThresholdOpt = Some(value)
+    super.setBroadcastThreshold(value)
+  }
+
+  override def getBroadcastThreshold: Int =
+    broadcastThresholdOpt
+      .orElse(GraphFramesConf.getConnectedComponentsBroadcastThreshold)
+      .getOrElse(super.getBroadcastThreshold)
+
+  override def setCheckpointInterval(value: Int): this.type = {
+    checkpointIntervalOpt = Some(value)
+    super.setCheckpointInterval(value)
+  }
+
+  override def getCheckpointInterval: Int =
+    checkpointIntervalOpt
+      .orElse(GraphFramesConf.getConnectedComponentsCheckpointInterval)
+      .getOrElse(super.getCheckpointInterval)
+
+  override def setIntermediateStorageLevel(value: StorageLevel): this.type = {
+    intermediateStorageLevelOpt = Some(value)
+    super.setIntermediateStorageLevel(value)
+  }
+
+  override def getIntermediateStorageLevel: StorageLevel =
+    intermediateStorageLevelOpt
+      .orElse(GraphFramesConf.getConnectedComponentsStorageLevel)
+      .getOrElse(super.getIntermediateStorageLevel)
+
+  override def setUseLocalCheckpoints(value: Boolean): this.type = {
+    useLocalCheckpointsOpt = Some(value)
+    super.setUseLocalCheckpoints(value)
+  }
+
+  override def getUseLocalCheckpoints: Boolean =
+    useLocalCheckpointsOpt
+      .orElse(GraphFramesConf.getUseLocalCheckpoints)
+      .getOrElse(super.getUseLocalCheckpoints)
 
   /**
    * Runs the connected components algorithm by delegating to [[GraphFrame.connectedComponents]]
-   * and returns a typed dataset of [[ConnectedComponentResult]].
+   * and returns a persisted and materialized dataset of [[ConnectedComponentResult]].
    */
   def run(): Dataset[ConnectedComponentResult] = {
     val cc = graph.toGraphFrame.connectedComponents
-      .setAlgorithm(algorithm)
-      .setBroadcastThreshold(broadcastThreshold)
-      .setCheckpointInterval(checkpointInterval)
-      .setIntermediateStorageLevel(intermediateStorageLevel)
-      .setUseLocalCheckpoints(useLocalCheckpoints)
+    algorithmOpt.foreach(cc.setAlgorithm)
+    broadcastThresholdOpt.foreach(cc.setBroadcastThreshold)
+    checkpointIntervalOpt.foreach(cc.setCheckpointInterval)
+    intermediateStorageLevelOpt.foreach(cc.setIntermediateStorageLevel)
+    useLocalCheckpointsOpt.foreach(cc.setUseLocalCheckpoints)
     maxIter.foreach(cc.maxIter)
 
-    cc.run()
+    val rawDF = cc.run()
+    val typed = rawDF
       .select(
         col(GraphFrame.ID).alias("id"),
         col(ConnectedComponents.COMPONENT).alias("connectedComponent"))
       .as[ConnectedComponentResult]
+    val res =
+      DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, cc.getIntermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 

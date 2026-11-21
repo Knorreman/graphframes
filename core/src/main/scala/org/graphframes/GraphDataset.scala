@@ -21,13 +21,17 @@ import org.apache.spark.graphframes.graphx.Edge
 import org.apache.spark.graphframes.graphx.Graph
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
-import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.array
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.functions.countDistinct
 import org.apache.spark.sql.functions.explode
+import org.apache.spark.sql.types.ByteType
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.ShortType
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.lib.AggregateMessagesDataset
 import org.graphframes.lib.AggregateNeighborsDataset
@@ -53,6 +57,7 @@ import org.graphframes.lib.StronglyConnectedComponentsDataset
 import org.graphframes.lib.StructureAwareLabelPropagationDataset
 import org.graphframes.lib.TriangleCountDataset
 import org.graphframes.lib.TypedDegreeMetrics
+import org.graphframes.lib.TypedDegreePair
 import org.graphframes.lib.TypedDegreeResult
 import org.graphframes.lib.VertexId
 
@@ -180,7 +185,7 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group utils
    */
   def validate(checkVertices: Boolean, intermediateStorageLevel: StorageLevel): Unit = {
-    val persistedVertices = vertices.persist(intermediateStorageLevel)
+    val persistedVertices = vertices.select(col("id")).persist(intermediateStorageLevel)
     try {
       val countDistinctVertices = persistedVertices.select(countDistinct("id")).first().getLong(0)
       val verticesCount = persistedVertices.count()
@@ -222,10 +227,14 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * Converts the directed graph into an undirected graph by adding a reverse edge `(dstId, srcId,
    * attr)` for every edge `(srcId, dstId, attr)`.
    *
+   * Note: self-loops (`srcId == dstId`) are duplicated in the resulting edge dataset.
+   *
    * @group utils
    */
   def asUndirected(): GraphDataset[VD, ED] = {
-    val reversed = edges.map(e => GraphEdge(e.dstId, e.srcId, e.attr))
+    val reversed = edges
+      .select(col("dstId").alias("srcId"), col("srcId").alias("dstId"), col("attr"))
+      .as[GraphEdge[ED]]
     GraphDataset(vertices, edges.union(reversed))
   }
 
@@ -235,7 +244,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * @group utils
    */
   def asReversed(): GraphDataset[VD, ED] = {
-    val reversed = edges.map(e => GraphEdge(e.dstId, e.srcId, e.attr))
+    val reversed = edges
+      .select(col("dstId").alias("srcId"), col("srcId").alias("dstId"), col("attr"))
+      .as[GraphEdge[ED]]
     GraphDataset(vertices, reversed)
   }
 
@@ -248,7 +259,8 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    */
   def vertices: Dataset[GraphVertex[VD]] = {
     if (_vertices == null) {
-      throw new Exception("You cannot use GraphDataset objects within a Spark closure")
+      throw new IllegalStateException(
+        "You cannot use GraphDataset objects within a Spark closure")
     }
     _vertices
   }
@@ -260,7 +272,8 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    */
   def edges: Dataset[GraphEdge[ED]] = {
     if (_edges == null) {
-      throw new Exception("You cannot use GraphDataset objects within a Spark closure")
+      throw new IllegalStateException(
+        "You cannot use GraphDataset objects within a Spark closure")
     }
     _edges
   }
@@ -358,34 +371,34 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
   /**
    * The out-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
    *
-   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
-   * includes all specified categories (defaulting missing ones to `0`).
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
    *
    * @group degree
    */
-  def typeOutDegree[K: Encoder: TypeTag](
+  def typeOutDegree[K: TypeTag](
       edgeType: ED => K,
       edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
-    implicit val pairEncoder: Encoder[(VertexId, K)] =
-      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
-    val pairs = edges.map(e => (e.srcId, edgeType(e.attr)))
+    val pairs: Dataset[TypedDegreePair[K]] =
+      edges.map(e => TypedDegreePair(e.srcId, edgeType(e.attr)))
     TypedDegreeMetrics.compute(pairs, edgeTypes)
   }
 
   /**
    * The in-degree of each vertex grouped by a typed edge category extracted via `edgeType`.
    *
-   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
-   * includes all specified categories (defaulting missing ones to `0`).
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
    *
    * @group degree
    */
-  def typeInDegree[K: Encoder: TypeTag](
+  def typeInDegree[K: TypeTag](
       edgeType: ED => K,
       edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
-    implicit val pairEncoder: Encoder[(VertexId, K)] =
-      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
-    val pairs = edges.map(e => (e.dstId, edgeType(e.attr)))
+    val pairs: Dataset[TypedDegreePair[K]] =
+      edges.map(e => TypedDegreePair(e.dstId, edgeType(e.attr)))
     TypedDegreeMetrics.compute(pairs, edgeTypes)
   }
 
@@ -393,19 +406,18 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
    * The total degree (in + out) of each vertex grouped by a typed edge category extracted via
    * `edgeType`.
    *
-   * If `edgeTypes` is specified, only those categories are counted and each returned vertex's map
-   * includes all specified categories (defaulting missing ones to `0`).
+   * Categories returning `null` are ignored. If `edgeTypes` is specified, only those non-null
+   * categories are counted and each returned vertex's map includes all specified categories
+   * (defaulting missing ones to `0`).
    *
    * @group degree
    */
-  def typeDegree[K: Encoder: TypeTag](
+  def typeDegree[K: TypeTag](
       edgeType: ED => K,
       edgeTypes: Option[Seq[K]] = None): Dataset[TypedDegreeResult[K]] = {
-    implicit val pairEncoder: Encoder[(VertexId, K)] =
-      Encoders.tuple(Encoders.scalaLong, implicitly[Encoder[K]])
-    val pairs = edges.flatMap { e =>
+    val pairs: Dataset[TypedDegreePair[K]] = edges.flatMap { e =>
       val k = edgeType(e.attr)
-      Seq((e.srcId, k), (e.dstId, k))
+      Iterator(TypedDegreePair(e.srcId, k), TypedDegreePair(e.dstId, k))
     }
     TypedDegreeMetrics.compute(pairs, edgeTypes)
   }
@@ -447,7 +459,7 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
   def subgraph(
       epred: GraphEdge[ED] => Boolean = _ => true,
       vpred: GraphVertex[VD] => Boolean = _ => true): GraphDataset[VD, ED] = {
-    filterVertices(vpred).filterEdges(epred)
+    filterEdges(epred).filterVertices(vpred)
   }
 
   /**
@@ -487,6 +499,9 @@ class GraphDataset[VD: TypeTag, ED: TypeTag] private (
   /**
    * Transform each edge attribute using the full triplet (source vertex, edge, destination
    * vertex).
+   *
+   * Note: because this operates over [[triplets]], edges whose source or destination vertex is
+   * absent from [[vertices]] are omitted.
    *
    * @group subgraph
    */
@@ -745,27 +760,57 @@ object GraphDataset extends Serializable with Logging {
    * Construct a [[GraphDataset]] from an edge dataset, inferring the vertex set from the distinct
    * edge endpoints and assigning each vertex `defaultVertexAttribute`.
    */
-  def fromEdges[ED: TypeTag, VD: TypeTag](
+  def fromEdges[VD: TypeTag, ED: TypeTag](
       edges: Dataset[GraphEdge[ED]],
-      defaultVertexAttribute: VD = null.asInstanceOf[VD]): GraphDataset[VD, ED] = {
+      defaultVertexAttribute: VD): GraphDataset[VD, ED] = {
     val session = edges.sparkSession
     import session.implicits.*
-    val srcs = edges.map(e => e.srcId)
-    val dsts = edges.map(e => e.dstId)
-    val vertices: Dataset[GraphVertex[VD]] = srcs
-      .union(dsts)
+    val vertices: Dataset[GraphVertex[VD]] = edges
+      .select(explode(array(col("srcId"), col("dstId"))).alias("id"))
       .distinct()
+      .as[VertexId]
       .map((id: VertexId) => GraphVertex(id, defaultVertexAttribute))
     apply(vertices, edges)
+  }
+
+  private def isIntegralType(dt: DataType): Boolean = dt match {
+    case ByteType | ShortType | IntegerType | LongType => true
+    case _ => false
   }
 
   /**
    * Construct a [[GraphDataset]] from an existing [[GraphFrame]].
    *
-   * The vertices DataFrame must contain `id` (castable to `Long`) and `attr` columns, and the
-   * edges DataFrame must contain `src`, `dst` (castable to `Long`), and `attr` columns.
+   * The vertices DataFrame must contain an integral `id` column (`Byte`, `Short`, `Int`, or
+   * `Long`) and an `attr` column; the edges DataFrame must contain integral `src` and `dst`
+   * columns and an `attr` column.
    */
   def fromGraphFrame[VD: TypeTag, ED: TypeTag](graph: GraphFrame): GraphDataset[VD, ED] = {
+    require(graph != null, "graph must not be null.")
+    val idType = graph.vertices.schema(GraphFrame.ID).dataType
+    require(
+      isIntegralType(idType),
+      s"GraphDataset vertex ID column '${GraphFrame.ID}' must be an integral type " +
+        s"(Byte, Short, Int, Long), but found $idType.")
+    val srcType = graph.edges.schema(GraphFrame.SRC).dataType
+    require(
+      isIntegralType(srcType),
+      s"GraphDataset edge column '${GraphFrame.SRC}' must be an integral type " +
+        s"(Byte, Short, Int, Long), but found $srcType.")
+    val dstType = graph.edges.schema(GraphFrame.DST).dataType
+    require(
+      isIntegralType(dstType),
+      s"GraphDataset edge column '${GraphFrame.DST}' must be an integral type " +
+        s"(Byte, Short, Int, Long), but found $dstType.")
+    require(
+      graph.vertices.columns.contains(GraphFrame.ATTR),
+      s"Vertex attribute column '${GraphFrame.ATTR}' is missing from GraphFrame.vertices " +
+        s"(columns: ${graph.vertices.columns.mkString(", ")}).")
+    require(
+      graph.edges.columns.contains(GraphFrame.ATTR),
+      s"Edge attribute column '${GraphFrame.ATTR}' is missing from GraphFrame.edges " +
+        s"(columns: ${graph.edges.columns.mkString(", ")}).")
+
     val vv = graph.vertices
       .select(col(GraphFrame.ID).cast("long").alias("id"), col(GraphFrame.ATTR).alias("attr"))
       .as[GraphVertex[VD]]

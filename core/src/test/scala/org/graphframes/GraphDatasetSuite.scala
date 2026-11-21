@@ -317,4 +317,69 @@ class GraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     assert(g.outDegrees.isEmpty)
     assert(g.dropIsolatedVertices().vertices.isEmpty)
   }
+
+  test("validate preserves pre-cached caller vertices and edges") {
+    import sqlImplicits.*
+    val vv = spark.createDataset(Seq(GraphVertex(1L, "A"), GraphVertex(2L, "B"))).cache()
+    val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, "know"))).cache()
+    val _ = (vv.count(), ee.count())
+    val g = GraphDataset(vv, ee)
+    try {
+      g.validate()
+      assert(vv.storageLevel !== StorageLevel.NONE)
+      assert(ee.storageLevel !== StorageLevel.NONE)
+    } finally {
+      vv.unpersist(blocking = true)
+      ee.unpersist(blocking = true)
+    }
+  }
+
+  test("fromGraphFrame rejects non-integral IDs and missing attr columns") {
+    val validV = spark.createDataFrame(Seq((1L, "A"), (2L, "B"))).toDF("id", "attr")
+    val validE = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "attr")
+
+    val strV = spark.createDataFrame(Seq(("1", "A"))).toDF("id", "attr")
+    intercept[IllegalArgumentException] {
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(strV, validE))
+    }
+
+    val dblE = spark.createDataFrame(Seq((1.0, 2.0, "know"))).toDF("src", "dst", "attr")
+    intercept[IllegalArgumentException] {
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validV, dblE))
+    }
+
+    val noAttrV = spark.createDataFrame(Seq((1L, "A"))).toDF("id", "name")
+    intercept[IllegalArgumentException] {
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(noAttrV, validE))
+    }
+
+    val noAttrE = spark.createDataFrame(Seq((1L, 2L, "know"))).toDF("src", "dst", "rel")
+    intercept[IllegalArgumentException] {
+      val _ = GraphDataset.fromGraphFrame[String, String](GraphFrame(validV, noAttrE))
+    }
+  }
+
+  test("fromEdges supports explicit [VD, ED] type parameters") {
+    val g = GraphDataset.fromEdges[String, String](edges, "default")
+    assert(g.vertices.count() === 3L)
+    assert(g.edges.count() === 3L)
+  }
+
+  test("asReversed and asUndirected with custom case class ED and self-loop") {
+    import sqlImplicits.*
+    val vv = spark.createDataset(
+      Seq(GraphVertex(1L, PersonAttr("A", 1)), GraphVertex(2L, PersonAttr("B", 2))))
+    val ee = spark.createDataset(
+      Seq(
+        GraphEdge(1L, 2L, RelationAttr("friend", 1.0)),
+        GraphEdge(1L, 1L, RelationAttr("self", 0.5))))
+    val g = GraphDataset(vv, ee)
+
+    assert(
+      g.asReversed().edges.collect().toSet === Set(
+        GraphEdge(2L, 1L, RelationAttr("friend", 1.0)),
+        GraphEdge(1L, 1L, RelationAttr("self", 0.5))))
+    // Self-loop is duplicated when both forward and reversed edges are unioned
+    assert(g.asUndirected().edges.count() === 4L)
+  }
 }

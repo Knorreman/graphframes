@@ -17,6 +17,7 @@
 
 package org.graphframes.lib
 
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrameTestSparkContext
 import org.graphframes.SparkFunSuite
@@ -116,5 +117,50 @@ class ConnectedComponentsDatasetSuite extends SparkFunSuite with GraphFrameTestS
 
     val cc = g.connectedComponents.run().collect().map(r => r.id -> r.connectedComponent).toMap
     assert(cc === Map(1L -> 1L, 2L -> 2L))
+  }
+
+  test("respects GraphFramesConf settings and releases raw DF cache on unpersist") {
+    val algoKey = "spark.graphframes.connectedComponents.algorithm"
+    val localCkptKey = "spark.graphframes.useLocalCheckpoints"
+    val prevAlgo = spark.conf.getOption(algoKey)
+    val prevLocal = spark.conf.getOption(localCkptKey)
+
+    spark.conf.set(algoKey, ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION)
+    spark.conf.set(localCkptKey, "true")
+    try {
+      val vv = spark.createDataset((1L to 4L).map(i => GraphVertex(i, s"v$i"))).cache()
+      val ee = spark.createDataset(Seq(GraphEdge(1L, 2L, 1), GraphEdge(3L, 4L, 1))).cache()
+      assert(vv.count() === 4L)
+      assert(ee.count() === 2L)
+      val beforeIds = sc.getPersistentRDDs.keySet
+
+      val g = GraphDataset(vv, ee)
+      val builder = g.connectedComponents
+      assert(builder.getAlgorithm === ConnectedComponents.ALGO_RANDOMIZED_CONTRACTION)
+      assert(builder.getUseLocalCheckpoints === true)
+
+      val res = builder.run()
+      assert(res.storageLevel !== StorageLevel.NONE)
+      val groups = res.collect().groupBy(_.connectedComponent).values.map(_.map(_.id).toSet).toSet
+      assert(groups === Set(Set(1L, 2L), Set(3L, 4L)))
+
+      res.unpersist(blocking = true)
+      assert(res.storageLevel === StorageLevel.NONE)
+      assert(vv.unpersist(blocking = true).storageLevel === StorageLevel.NONE)
+      assert(ee.unpersist(blocking = true).storageLevel === StorageLevel.NONE)
+      val leaked = sc.getPersistentRDDs.filter { case (id, rdd) =>
+        !beforeIds.contains(id) && !rdd.isCheckpointed
+      }
+      assert(leaked.isEmpty, s"Unexpected persistent RDDs: ${leaked.values.map(_.name)}")
+    } finally {
+      prevAlgo match {
+        case Some(v) => spark.conf.set(algoKey, v)
+        case None => spark.conf.unset(algoKey)
+      }
+      prevLocal match {
+        case Some(v) => spark.conf.set(localCkptKey, v)
+        case None => spark.conf.unset(localCkptKey)
+      }
+    }
   }
 }

@@ -28,6 +28,8 @@ import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.functions;
+import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.storage.StorageLevel;
 import org.graphframes.lib.ClusterAssignment;
 import org.graphframes.lib.ConnectedComponentResult;
@@ -48,7 +50,6 @@ import org.graphframes.lib.SimplePath;
 import org.graphframes.lib.TriangleCountResult;
 import scala.Tuple2;
 import scala.Tuple3;
-import scala.Tuple4;
 import scala.Tuple5;
 
 import java.io.Serializable;
@@ -109,27 +110,72 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       VD defaultVertexAttr,
       Encoder<VD> vdEncoder,
       Encoder<ED> edEncoder) {
+    Objects.requireNonNull(edges, "edges must not be null");
+    Objects.requireNonNull(vdEncoder, "vdEncoder must not be null");
+    Objects.requireNonNull(edEncoder, "edEncoder must not be null");
     Dataset<Long> ids = edges
-        .flatMap(
-            (FlatMapFunction<Tuple3<Long, Long, ED>, Long>)
-                e -> Arrays.asList(e._1(), e._2()).iterator(),
-            Encoders.LONG())
-        .distinct();
+        .toDF("srcId", "dstId", ATTR_COL)
+        .select(functions.explode(functions.array(functions.col("srcId"), functions.col("dstId")))
+            .alias("id"))
+        .distinct()
+        .as(Encoders.LONG());
     Dataset<Tuple2<Long, VD>> vertices = ids.map(
         (MapFunction<Long, Tuple2<Long, VD>>) id -> new Tuple2<>(id, defaultVertexAttr),
         Encoders.tuple(Encoders.LONG(), vdEncoder));
     return new JavaGraphDataset<>(vertices, edges, vdEncoder, edEncoder);
   }
 
+  private static boolean isIntegralType(DataType dt) {
+    return DataTypes.ByteType.equals(dt)
+        || DataTypes.ShortType.equals(dt)
+        || DataTypes.IntegerType.equals(dt)
+        || DataTypes.LongType.equals(dt);
+  }
+
   /**
    * Constructs a {@link JavaGraphDataset} from an existing {@link GraphFrame} whose vertices have
-   * {@code id} and {@code attr} columns and whose edges have {@code src}, {@code dst}, and
-   * {@code attr} columns.
+   * an integral {@code id} column ({@code Byte}, {@code Short}, {@code Int}, or {@code Long}) and
+   * an {@code attr} column, and whose edges have integral {@code src} and {@code dst} columns and
+   * an {@code attr} column.
    */
   public static <VD, ED> JavaGraphDataset<VD, ED> fromGraphFrame(
       GraphFrame graph,
       Encoder<VD> vdEncoder,
       Encoder<ED> edEncoder) {
+    Objects.requireNonNull(graph, "graph must not be null");
+    Objects.requireNonNull(vdEncoder, "vdEncoder must not be null");
+    Objects.requireNonNull(edEncoder, "edEncoder must not be null");
+    DataType idType = graph.vertices().schema().apply(GraphFrame.ID()).dataType();
+    if (!isIntegralType(idType)) {
+      throw new IllegalArgumentException(
+          "GraphDataset vertex ID column '" + GraphFrame.ID()
+              + "' must be an integral type (Byte, Short, Int, Long), but found " + idType + ".");
+    }
+    DataType srcType = graph.edges().schema().apply(GraphFrame.SRC()).dataType();
+    if (!isIntegralType(srcType)) {
+      throw new IllegalArgumentException(
+          "GraphDataset edge column '" + GraphFrame.SRC()
+              + "' must be an integral type (Byte, Short, Int, Long), but found " + srcType + ".");
+    }
+    DataType dstType = graph.edges().schema().apply(GraphFrame.DST()).dataType();
+    if (!isIntegralType(dstType)) {
+      throw new IllegalArgumentException(
+          "GraphDataset edge column '" + GraphFrame.DST()
+              + "' must be an integral type (Byte, Short, Int, Long), but found " + dstType + ".");
+    }
+    List<String> vCols = Arrays.asList(graph.vertices().columns());
+    if (!vCols.contains(ATTR_COL)) {
+      throw new IllegalArgumentException(
+          "Vertex attribute column '" + ATTR_COL + "' is missing from GraphFrame.vertices (columns: "
+              + String.join(", ", vCols) + ").");
+    }
+    List<String> eCols = Arrays.asList(graph.edges().columns());
+    if (!eCols.contains(ATTR_COL)) {
+      throw new IllegalArgumentException(
+          "Edge attribute column '" + ATTR_COL + "' is missing from GraphFrame.edges (columns: "
+              + String.join(", ", eCols) + ").");
+    }
+
     Encoder<Tuple2<Long, VD>> vEnc = Encoders.tuple(Encoders.LONG(), vdEncoder);
     Encoder<Tuple3<Long, Long, ED>> eEnc =
         Encoders.tuple(Encoders.LONG(), Encoders.LONG(), edEncoder);
@@ -249,29 +295,45 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /** Validates graph consistency (duplicate vertices and dangling edge endpoints). */
   public void validate() {
-    toGraphFrame().validate();
+    validate(true, StorageLevel.MEMORY_AND_DISK());
   }
 
-  /** Validates graph consistency with custom options. */
+  /** Validates graph consistency with custom options without altering caller caches. */
   public void validate(boolean checkVertices, StorageLevel intermediateStorageLevel) {
-    toGraphFrame().validate(checkVertices, intermediateStorageLevel);
+    Objects.requireNonNull(
+        intermediateStorageLevel, "intermediateStorageLevel must not be null");
+    Dataset<Row> vIds = vertices().toDF(GraphFrame.ID(), ATTR_COL).select(GraphFrame.ID());
+    Dataset<Row> eIds = edges()
+        .toDF(GraphFrame.SRC(), GraphFrame.DST(), ATTR_COL)
+        .select(GraphFrame.SRC(), GraphFrame.DST());
+    GraphFrame.apply(vIds, eIds).validate(checkVertices, intermediateStorageLevel);
   }
 
   /** Returns a new graph with all edge directions reversed. */
   public JavaGraphDataset<VD, ED> asReversed() {
-    Dataset<Tuple3<Long, Long, ED>> rev = edges().map(
-        (MapFunction<Tuple3<Long, Long, ED>, Tuple3<Long, Long, ED>>)
-            e -> new Tuple3<>(e._2(), e._1(), e._3()),
-        edgeEncoder());
+    Dataset<Tuple3<Long, Long, ED>> rev = edges()
+        .toDF("_1", "_2", "_3")
+        .select(
+            functions.col("_2").alias("_1"),
+            functions.col("_1").alias("_2"),
+            functions.col("_3"))
+        .as(edgeEncoder());
     return new JavaGraphDataset<>(vertices(), rev, vdEncoder, edEncoder);
   }
 
-  /** Returns a new undirected graph adding reverse edges for every directed edge. */
+  /**
+   * Returns a new undirected graph adding a reverse edge for every directed edge.
+   *
+   * <p>Note: self-loops ({@code srcId == dstId}) are duplicated in the resulting edge dataset.
+   */
   public JavaGraphDataset<VD, ED> asUndirected() {
-    Dataset<Tuple3<Long, Long, ED>> rev = edges().map(
-        (MapFunction<Tuple3<Long, Long, ED>, Tuple3<Long, Long, ED>>)
-            e -> new Tuple3<>(e._2(), e._1(), e._3()),
-        edgeEncoder());
+    Dataset<Tuple3<Long, Long, ED>> rev = edges()
+        .toDF("_1", "_2", "_3")
+        .select(
+            functions.col("_2").alias("_1"),
+            functions.col("_1").alias("_2"),
+            functions.col("_3"))
+        .as(edgeEncoder());
     return new JavaGraphDataset<>(vertices(), edges().union(rev), vdEncoder, edEncoder);
   }
 
@@ -308,10 +370,12 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /**
    * Computes per-edge-type out-degrees as {@code Dataset<Tuple3<Long, K, Integer>>}
-   * {@code (vertexId, edgeType, count)}.
+   * {@code (vertexId, edgeType, count)}. {@code null} edge categories are ignored.
    */
   public <K> Dataset<Tuple3<Long, K, Integer>> typeOutDegree(
       MapFunction<ED, K> edgeTypeExtractor, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
     Dataset<Tuple2<Long, K>> pairs = edges().map(
         (MapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>)
             e -> new Tuple2<>(e._1(), edgeTypeExtractor.call(e._3())),
@@ -321,10 +385,12 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /**
    * Computes per-edge-type in-degrees as {@code Dataset<Tuple3<Long, K, Integer>>}
-   * {@code (vertexId, edgeType, count)}.
+   * {@code (vertexId, edgeType, count)}. {@code null} edge categories are ignored.
    */
   public <K> Dataset<Tuple3<Long, K, Integer>> typeInDegree(
       MapFunction<ED, K> edgeTypeExtractor, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
     Dataset<Tuple2<Long, K>> pairs = edges().map(
         (MapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>)
             e -> new Tuple2<>(e._2(), edgeTypeExtractor.call(e._3())),
@@ -334,10 +400,12 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /**
    * Computes per-edge-type total degrees as {@code Dataset<Tuple3<Long, K, Integer>>}
-   * {@code (vertexId, edgeType, count)}.
+   * {@code (vertexId, edgeType, count)}. {@code null} edge categories are ignored.
    */
   public <K> Dataset<Tuple3<Long, K, Integer>> typeDegree(
       MapFunction<ED, K> edgeTypeExtractor, Encoder<K> keyEncoder) {
+    Objects.requireNonNull(edgeTypeExtractor, "edgeTypeExtractor must not be null");
+    Objects.requireNonNull(keyEncoder, "keyEncoder must not be null");
     Dataset<Tuple2<Long, K>> pairs = edges().flatMap(
         (FlatMapFunction<Tuple3<Long, Long, ED>, Tuple2<Long, K>>) e -> {
           K k = edgeTypeExtractor.call(e._3());
@@ -351,6 +419,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Dataset<Tuple2<Long, K>> pairs, Encoder<K> keyEncoder) {
     return pairs
         .toDF("id", "k")
+        .filter(functions.col("k").isNotNull())
         .groupBy(functions.col("id"), functions.col("k"))
         .agg(functions.count("*").cast("int").alias("cnt"))
         .select(
@@ -364,6 +433,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /** Filters vertices by predicate and removes edges referencing dropped vertices. */
   public JavaGraphDataset<VD, ED> filterVertices(FilterFunction<GraphVertex<VD>> condition) {
+    Objects.requireNonNull(condition, "condition must not be null");
     Dataset<Tuple2<Long, VD>> vv = vertices().filter(
         (FilterFunction<Tuple2<Long, VD>>) v -> condition.call(new GraphVertex<>(v._1(), v._2())));
     Dataset<Row> vvIds = vv.toDF("id", "attr").select(functions.col("id"));
@@ -377,6 +447,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
   /** Filters edges by predicate while keeping all vertices. */
   public JavaGraphDataset<VD, ED> filterEdges(FilterFunction<GraphEdge<ED>> condition) {
+    Objects.requireNonNull(condition, "condition must not be null");
     Dataset<Tuple3<Long, Long, ED>> ee = edges().filter(
         (FilterFunction<Tuple3<Long, Long, ED>>)
             e -> condition.call(new GraphEdge<>(e._1(), e._2(), e._3())));
@@ -386,7 +457,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Restricts the graph to vertices matching {@code vpred} and edges matching {@code epred}. */
   public JavaGraphDataset<VD, ED> subgraph(
       FilterFunction<GraphEdge<ED>> epred, FilterFunction<GraphVertex<VD>> vpred) {
-    return filterVertices(vpred).filterEdges(epred);
+    return filterEdges(epred).filterVertices(vpred);
   }
 
   /** Drops vertices that are not incident to any edge. */
@@ -405,6 +476,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Transforms each vertex attribute. */
   public <VD2> JavaGraphDataset<VD2, ED> mapVertices(
       Function2<Long, VD, VD2> fn, Encoder<VD2> vd2Encoder) {
+    Objects.requireNonNull(fn, "fn must not be null");
+    Objects.requireNonNull(vd2Encoder, "vd2Encoder must not be null");
     Dataset<Tuple2<Long, VD2>> vv = vertices().map(
         (MapFunction<Tuple2<Long, VD>, Tuple2<Long, VD2>>)
             v -> new Tuple2<>(v._1(), fn.call(v._1(), v._2())),
@@ -415,6 +488,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Transforms each edge attribute. */
   public <ED2> JavaGraphDataset<VD, ED2> mapEdges(
       MapFunction<GraphEdge<ED>, ED2> fn, Encoder<ED2> ed2Encoder) {
+    Objects.requireNonNull(fn, "fn must not be null");
+    Objects.requireNonNull(ed2Encoder, "ed2Encoder must not be null");
     Dataset<Tuple3<Long, Long, ED2>> ee = edges().map(
         (MapFunction<Tuple3<Long, Long, ED>, Tuple3<Long, Long, ED2>>)
             e -> new Tuple3<>(e._1(), e._2(), fn.call(new GraphEdge<>(e._1(), e._2(), e._3()))),
@@ -422,9 +497,16 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     return new JavaGraphDataset<>(vertices(), ee, vdEncoder, ed2Encoder);
   }
 
-  /** Transforms each edge attribute using the full triplet. */
+  /**
+   * Transforms each edge attribute using the full triplet.
+   *
+   * <p>Note: because this operates over {@code triplets()}, edges whose source or destination
+   * vertex is absent from {@code vertices()} are omitted.
+   */
   public <ED2> JavaGraphDataset<VD, ED2> mapTriplets(
       MapFunction<GraphTriplet<VD, ED>, ED2> fn, Encoder<ED2> ed2Encoder) {
+    Objects.requireNonNull(fn, "fn must not be null");
+    Objects.requireNonNull(ed2Encoder, "ed2Encoder must not be null");
     Dataset<Tuple3<Long, Long, ED2>> ee = triplets().map(
         (MapFunction<Tuple5<Long, Long, VD, VD, ED>, Tuple3<Long, Long, ED2>>)
             t -> new Tuple3<>(
@@ -522,6 +604,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
   /** Power Iteration Clustering with a typed edge weight extractor. */
   public Dataset<ClusterAssignment> powerIterationClustering(
       int k, int maxIter, MapFunction<ED, Double> weightExtractor) {
+    Objects.requireNonNull(weightExtractor, "weightExtractor must not be null");
     String weightCol = "_gf_pic_weight";
     Dataset<Row> vDF = vertices().toDF(GraphFrame.ID(), ATTR_COL);
     Dataset<Row> eDF = edges()
@@ -538,15 +621,67 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
         .as(ClusterAssignment.encoder());
   }
 
+  private static <T> Dataset<T> materializeAndReleaseRaw(
+      Dataset<Row> raw, Dataset<T> typed, StorageLevel storageLevel) {
+    Dataset<T> persisted = typed.persist(storageLevel);
+    boolean succeeded = false;
+    try {
+      persisted.count();
+      succeeded = true;
+      return persisted;
+    } finally {
+      if (!succeeded) {
+        persisted.unpersist();
+      }
+      if (!StorageLevel.NONE().equals(raw.storageLevel())) {
+        raw.unpersist();
+      }
+    }
+  }
+
+  private static <VD, ED> JavaGraphDataset<VD, ED> materializeGraphAndReleaseRaw(
+      GraphFrame rawGF,
+      Dataset<Tuple2<Long, VD>> typedVertices,
+      Dataset<Tuple3<Long, Long, ED>> typedEdges,
+      Encoder<VD> vdEncoder,
+      Encoder<ED> edEncoder,
+      StorageLevel storageLevel) {
+    Dataset<Tuple2<Long, VD>> persistedV = typedVertices.persist(storageLevel);
+    Dataset<Tuple3<Long, Long, ED>> persistedE = typedEdges.persist(storageLevel);
+    boolean succeeded = false;
+    try {
+      persistedV.count();
+      persistedE.count();
+      succeeded = true;
+      return JavaGraphDataset.of(persistedV, persistedE, vdEncoder, edEncoder);
+    } finally {
+      if (!succeeded) {
+        persistedV.unpersist();
+        persistedE.unpersist();
+      }
+      if (!StorageLevel.NONE().equals(rawGF.vertices().storageLevel())) {
+        rawGF.vertices().unpersist();
+      }
+      if (!StorageLevel.NONE().equals(rawGF.edges().storageLevel())) {
+        rawGF.edges().unpersist();
+      }
+    }
+  }
+
   // ============== Nested Algorithm Builders ==============
 
+  /**
+   * Connected Components builder. Returns a persisted and materialized dataset; callers should
+   * call {@code unpersist()} when finished. Unset configuration parameters defer to Spark SQL
+   * {@code spark.graphframes.*} defaults.
+   */
   public static final class JavaConnectedComponents implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
-    private String algorithm = ConnectedComponents.ALGO_TWO_PHASE();
-    private int broadcastThreshold = 1000000;
-    private int checkpointInterval = 2;
-    private boolean useLocalCheckpoints = false;
-    private StorageLevel storageLevel = StorageLevel.MEMORY_AND_DISK();
+    private String algorithm = null;
+    private Integer broadcastThreshold = null;
+    private Integer checkpointInterval = null;
+    private Boolean useLocalCheckpoints = null;
+    private StorageLevel storageLevel = null;
     private Integer maxIter = null;
 
     JavaConnectedComponents(JavaGraphDataset<?, ?> graph) {
@@ -554,7 +689,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaConnectedComponents setAlgorithm(String value) {
-      this.algorithm = value;
+      this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
       return this;
     }
 
@@ -574,7 +709,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaConnectedComponents setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -585,22 +721,39 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
     public Dataset<ConnectedComponentResult> run() {
       ConnectedComponents cc = graph.toGraphFrame().connectedComponents();
-      cc.setAlgorithm(algorithm);
-      cc.setBroadcastThreshold(broadcastThreshold);
-      cc.setCheckpointInterval(checkpointInterval);
-      cc.setUseLocalCheckpoints(useLocalCheckpoints);
-      cc.setIntermediateStorageLevel(storageLevel);
+      if (algorithm != null) {
+        cc.setAlgorithm(algorithm);
+      }
+      if (broadcastThreshold != null) {
+        cc.setBroadcastThreshold(broadcastThreshold);
+      }
+      if (checkpointInterval != null) {
+        cc.setCheckpointInterval(checkpointInterval);
+      }
+      if (useLocalCheckpoints != null) {
+        cc.setUseLocalCheckpoints(useLocalCheckpoints);
+      }
+      if (storageLevel != null) {
+        cc.setIntermediateStorageLevel(storageLevel);
+      }
       if (maxIter != null) {
         cc.maxIter(maxIter);
       }
-      return cc.run()
+      StorageLevel targetLevel = cc.getIntermediateStorageLevel();
+      Dataset<Row> rawDF = cc.run();
+      Dataset<ConnectedComponentResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
               functions.col("component").alias("connectedComponent"))
           .as(ConnectedComponentResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, targetLevel);
     }
   }
 
+  /**
+   * PageRank builder. Returns a persisted and materialized {@link JavaGraphDataset}; callers
+   * should call {@code unpersist()} when finished.
+   */
   public static final class JavaPageRank<VD, ED> implements Serializable {
     private final JavaGraphDataset<VD, ED> graph;
     private double resetProb = 0.15;
@@ -664,13 +817,19 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
                   functions.col(ATTR_COL).alias("_1"),
                   functions.col("weight").alias("_2")).alias("_3"))
           .as(Encoders.tuple(Encoders.LONG(), Encoders.LONG(), eAttrEnc));
-      return JavaGraphDataset.of(vv, ee, vAttrEnc, eAttrEnc);
+      return materializeGraphAndReleaseRaw(
+          resGF, vv, ee, vAttrEnc, eAttrEnc, StorageLevel.MEMORY_AND_DISK());
     }
   }
 
+  /**
+   * Shortest Paths builder. Returns a persisted and materialized dataset; callers should call
+   * {@code unpersist()} when finished.
+   */
   public static final class JavaShortestPaths implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private List<Long> landmarks;
+    private String algorithm = "graphx";
     private boolean isDirected = true;
     private boolean useLocalCheckpoints = false;
     private int checkpointInterval = 2;
@@ -681,7 +840,13 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaShortestPaths landmarks(List<Long> value) {
-      this.landmarks = value;
+      this.landmarks = Objects.requireNonNull(value, "landmarks must not be null");
+      return this;
+    }
+
+    /** Sets the algorithm ({@code "graphx"} or {@code "graphframes"}). */
+    public JavaShortestPaths setAlgorithm(String value) {
+      this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
       return this;
     }
 
@@ -701,7 +866,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaShortestPaths setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -709,19 +875,27 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Objects.requireNonNull(landmarks, "landmarks must be set");
       org.graphframes.lib.ShortestPaths sp = graph.toGraphFrame().shortestPaths();
       sp.landmarks(new ArrayList<>(landmarks));
+      sp.setAlgorithm(algorithm);
       sp.setIsDirected(isDirected);
       sp.setUseLocalCheckpoints(useLocalCheckpoints);
       sp.setCheckpointInterval(checkpointInterval);
       sp.setIntermediateStorageLevel(storageLevel);
-      return sp.run()
+      Dataset<Row> rawDF = sp.run();
+      Dataset<ShortestPathsResult> typed = rawDF
           .select(functions.col(GraphFrame.ID()).alias("id"), functions.col("distances"))
           .as(ShortestPathsResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
   }
 
+  /**
+   * Triangle Count builder. Returns a persisted and materialized dataset; callers should call
+   * {@code unpersist()} when finished.
+   */
   public static final class JavaTriangleCount implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private String algorithm = "exact";
+    private int lgNomEntries = 12;
     private StorageLevel storageLevel = StorageLevel.MEMORY_AND_DISK();
 
     JavaTriangleCount(JavaGraphDataset<?, ?> graph) {
@@ -729,30 +903,49 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaTriangleCount setAlgorithm(String value) {
-      this.algorithm = value;
+      this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
+      return this;
+    }
+
+    /** Sets log2 of nominal entries used by approximate Theta sketches (4 to 26). */
+    public JavaTriangleCount setLgNomEntries(int value) {
+      if (value < 4 || value > 26) {
+        throw new IllegalArgumentException(
+            "lgNomEntries must be between 4 and 26, but got " + value);
+      }
+      this.lgNomEntries = value;
       return this;
     }
 
     public JavaTriangleCount setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
     public Dataset<TriangleCountResult> run() {
       org.graphframes.lib.TriangleCount tc = graph.toGraphFrame().triangleCount();
       tc.setAlgorithm(algorithm);
+      tc.setLgNomEntries(lgNomEntries);
       tc.setIntermediateStorageLevel(storageLevel);
-      return tc.run()
+      Dataset<Row> rawDF = tc.run();
+      Dataset<TriangleCountResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
               functions.col("count").cast("long").alias("count"))
           .as(TriangleCountResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
   }
 
+  /**
+   * Label Propagation builder. Returns a persisted and materialized dataset; callers should call
+   * {@code unpersist()} when finished.
+   */
   public static final class JavaLabelPropagation implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private Integer maxIter = null;
+    private String algorithm = "graphx";
     private boolean useLocalCheckpoints = false;
     private int checkpointInterval = 2;
     private StorageLevel storageLevel = StorageLevel.MEMORY_AND_DISK();
@@ -763,6 +956,12 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
 
     public JavaLabelPropagation maxIter(int value) {
       this.maxIter = value;
+      return this;
+    }
+
+    /** Sets the algorithm ({@code "graphx"} or {@code "graphframes"}). */
+    public JavaLabelPropagation setAlgorithm(String value) {
+      this.algorithm = Objects.requireNonNull(value, "algorithm must not be null");
       return this;
     }
 
@@ -777,7 +976,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaLabelPropagation setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -785,17 +985,27 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       Objects.requireNonNull(maxIter, "maxIter must be set");
       org.graphframes.lib.LabelPropagation lp = graph.toGraphFrame().labelPropagation();
       lp.maxIter(maxIter);
+      lp.setAlgorithm(algorithm);
       lp.setUseLocalCheckpoints(useLocalCheckpoints);
       lp.setCheckpointInterval(checkpointInterval);
       lp.setIntermediateStorageLevel(storageLevel);
-      return lp.run()
+      Dataset<Row> rawDF = lp.run();
+      // GraphFrames LPA can emit null label for vertices with zero incoming edges
+      Dataset<LabelPropagationResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
-              functions.col("label").cast("long").alias("label"))
+              functions.coalesce(functions.col("label"), functions.col(GraphFrame.ID()))
+                  .cast("long")
+                  .alias("label"))
           .as(LabelPropagationResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
   }
 
+  /**
+   * Strongly Connected Components builder. Returns a persisted and materialized dataset; callers
+   * should call {@code unpersist()} when finished.
+   */
   public static final class JavaStronglyConnectedComponents implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private Integer maxIter = null;
@@ -814,14 +1024,20 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       org.graphframes.lib.StronglyConnectedComponents scc =
           graph.toGraphFrame().stronglyConnectedComponents();
       scc.maxIter(maxIter);
-      return scc.run()
+      Dataset<Row> rawDF = scc.run();
+      Dataset<ConnectedComponentResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
               functions.col("component").alias("connectedComponent"))
           .as(ConnectedComponentResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, StorageLevel.MEMORY_AND_DISK());
     }
   }
 
+  /**
+   * K-Core decomposition builder. Returns a persisted and materialized dataset; callers should
+   * call {@code unpersist()} when finished.
+   */
   public static final class JavaKCore implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private boolean useLocalCheckpoints = false;
@@ -843,7 +1059,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaKCore setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -852,14 +1069,20 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       kc.setUseLocalCheckpoints(useLocalCheckpoints);
       kc.setCheckpointInterval(checkpointInterval);
       kc.setIntermediateStorageLevel(storageLevel);
-      return kc.run()
+      Dataset<Row> rawDF = kc.run();
+      Dataset<KCoreResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
               functions.col(KCore.kCoreColumnName()).alias("kcore"))
           .as(KCoreResult.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
   }
 
+  /**
+   * Maximal Independent Set builder. Returns a persisted and materialized dataset; callers should
+   * call {@code unpersist()} when finished.
+   */
   public static final class JavaMaximalIndependentSet<VD, ED> implements Serializable {
     private final JavaGraphDataset<VD, ED> graph;
     private boolean useLocalCheckpoints = false;
@@ -881,7 +1104,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaMaximalIndependentSet<VD, ED> setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -891,15 +1115,20 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       mis.setUseLocalCheckpoints(useLocalCheckpoints);
       mis.setCheckpointInterval(checkpointInterval);
       mis.setIntermediateStorageLevel(storageLevel);
-      Dataset<Row> misIds = mis.run(seed)
-          .select(functions.col(GraphFrame.ID()).alias("id"));
-      return graph.vertices()
+      Dataset<Row> rawMis = mis.run(seed);
+      Dataset<Row> misIds = rawMis.select(functions.col(GraphFrame.ID()).alias("id"));
+      Dataset<Tuple2<Long, VD>> typed = graph.vertices()
           .toDF("_1", "_2")
           .join(misIds, functions.col("_1").equalTo(misIds.col("id")), "left_semi")
           .as(graph.vertexEncoder());
+      return materializeAndReleaseRaw(rawMis, typed, storageLevel);
     }
   }
 
+  /**
+   * Cycle Detection builder. Returns a persisted and materialized dataset; callers should call
+   * {@code unpersist()} when finished.
+   */
   public static final class JavaDetectingCycles implements Serializable {
     private final JavaGraphDataset<?, ?> graph;
     private boolean useLocalCheckpoints = false;
@@ -921,7 +1150,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaDetectingCycles setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -930,11 +1160,13 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       dc.setUseLocalCheckpoints(useLocalCheckpoints);
       dc.setCheckpointInterval(checkpointInterval);
       dc.setIntermediateStorageLevel(storageLevel);
-      return dc.run()
+      Dataset<Row> rawDF = dc.run();
+      Dataset<SimplePath> typed = rawDF
           .select(
               functions.col(DetectingCycles.foundSeqCol()).alias("path"),
               functions.size(functions.col(DetectingCycles.foundSeqCol())).minus(1).alias("length"))
           .as(SimplePath.encoder());
+      return materializeAndReleaseRaw(rawDF, typed, storageLevel);
     }
   }
 
@@ -950,21 +1182,25 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaBFS<VD, ED> fromPred(FilterFunction<GraphVertex<VD>> predicate) {
-      this.fromPred = predicate;
+      this.fromPred = Objects.requireNonNull(predicate, "fromPred must not be null");
       return this;
     }
 
     public JavaBFS<VD, ED> toPred(FilterFunction<GraphVertex<VD>> predicate) {
-      this.toPred = predicate;
+      this.toPred = Objects.requireNonNull(predicate, "toPred must not be null");
       return this;
     }
 
     public JavaBFS<VD, ED> edgeFilter(FilterFunction<GraphEdge<ED>> predicate) {
-      this.edgeFilter = predicate;
+      this.edgeFilter = Objects.requireNonNull(predicate, "edgeFilter must not be null");
       return this;
     }
 
     public JavaBFS<VD, ED> maxPathLength(int value) {
+      if (value < 0) {
+        throw new IllegalArgumentException(
+            "BFS maxPathLength must be >= 0, but was set to " + value);
+      }
       this.maxPathLength = value;
       return this;
     }
@@ -980,21 +1216,18 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
       String toCol = "_gf_jbfs_to";
       Dataset<Row> vDF = graph.vertices()
           .map(
-              (MapFunction<Tuple2<Long, VD>, Tuple4<Long, VD, Boolean, Boolean>>) v -> {
+              (MapFunction<Tuple2<Long, VD>, Tuple3<Long, Boolean, Boolean>>) v -> {
                 GraphVertex<VD> gv = new GraphVertex<>(v._1(), v._2());
-                return new Tuple4<>(v._1(), v._2(), fFn.call(gv), tFn.call(gv));
+                return new Tuple3<>(v._1(), fFn.call(gv), tFn.call(gv));
               },
-              Encoders.tuple(
-                  Encoders.LONG(),
-                  graph.vertexAttrEncoder(),
-                  Encoders.BOOLEAN(),
-                  Encoders.BOOLEAN()))
-          .toDF(GraphFrame.ID(), ATTR_COL, fromCol, toCol);
+              Encoders.tuple(Encoders.LONG(), Encoders.BOOLEAN(), Encoders.BOOLEAN()))
+          .toDF(GraphFrame.ID(), fromCol, toCol);
 
       JavaGraphDataset<VD, ED> edgeFiltered =
           edgeFilter != null ? graph.filterEdges(edgeFilter) : graph;
       Dataset<Row> eDF = edgeFiltered.edges()
-          .toDF(GraphFrame.SRC(), GraphFrame.DST(), ATTR_COL);
+          .toDF(GraphFrame.SRC(), GraphFrame.DST(), ATTR_COL)
+          .select(GraphFrame.SRC(), GraphFrame.DST());
 
       Dataset<Row> resDF = GraphFrame.apply(vDF, eDF).bfs()
           .fromExpr(functions.col(fromCol))
@@ -1046,21 +1279,25 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaAllPaths<VD, ED> fromPred(FilterFunction<GraphVertex<VD>> predicate) {
-      this.fromPred = predicate;
+      this.fromPred = Objects.requireNonNull(predicate, "fromPred must not be null");
       return this;
     }
 
     public JavaAllPaths<VD, ED> toPred(FilterFunction<GraphVertex<VD>> predicate) {
-      this.toPred = predicate;
+      this.toPred = Objects.requireNonNull(predicate, "toPred must not be null");
       return this;
     }
 
     public JavaAllPaths<VD, ED> edgeFilter(FilterFunction<GraphEdge<ED>> predicate) {
-      this.edgeFilter = predicate;
+      this.edgeFilter = Objects.requireNonNull(predicate, "edgeFilter must not be null");
       return this;
     }
 
     public JavaAllPaths<VD, ED> maxPathLength(int value) {
+      if (value <= 0) {
+        throw new IllegalArgumentException(
+            "AllPaths maxPathLength must be > 0, but was set to " + value);
+      }
       this.maxPathLength = value;
       return this;
     }
@@ -1081,7 +1318,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public JavaAllPaths<VD, ED> setIntermediateStorageLevel(StorageLevel value) {
-      this.storageLevel = value;
+      this.storageLevel = Objects.requireNonNull(
+          value, "intermediateStorageLevel must not be null");
       return this;
     }
 
@@ -1106,7 +1344,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
           edgeFilter != null ? graph.filterEdges(edgeFilter) : graph;
       Dataset<Row> eDF = edgeFiltered.edges()
           .toDF(GraphFrame.SRC(), GraphFrame.DST(), ATTR_COL)
-          .select(GraphFrame.SRC(), GraphFrame.DST());
+          .select(GraphFrame.SRC(), GraphFrame.DST())
+          .distinct();
 
       org.graphframes.lib.AllPaths ap = GraphFrame.apply(vDF, eDF).allPaths();
       ap.fromExpr(functions.col(fromCol));
@@ -1122,6 +1361,10 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
   }
 
+  /**
+   * SVD++ collaborative filtering builder. Returns a persisted and materialized dataset alongside
+   * training loss; callers should call {@code unpersist()} when finished.
+   */
   public static final class JavaSVDPlusPlus<VD, ED> implements Serializable {
     private final JavaGraphDataset<VD, ED> graph;
     private int rank = 10;
@@ -1178,6 +1421,7 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
     }
 
     public Tuple2<Dataset<SVDPlusPlusResult>, Double> run(MapFunction<ED, Double> weightExtractor) {
+      Objects.requireNonNull(weightExtractor, "weightExtractor must not be null");
       Dataset<Row> vDF = graph.vertices().toDF(GraphFrame.ID(), ATTR_COL);
       Dataset<Row> eDF = graph.edges()
           .map(
@@ -1198,7 +1442,8 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
         svd.maxIter(maxIter);
       }
 
-      Dataset<SVDPlusPlusResult> typed = svd.run()
+      Dataset<Row> rawDF = svd.run();
+      Dataset<SVDPlusPlusResult> typed = rawDF
           .select(
               functions.col(GraphFrame.ID()).alias("id"),
               functions.col(SVDPlusPlus.COLUMN1()).alias("column1"),
@@ -1206,7 +1451,9 @@ public class JavaGraphDataset<VD, ED> implements Serializable {
               functions.col(SVDPlusPlus.COLUMN3()).alias("column3"),
               functions.col(SVDPlusPlus.COLUMN4()).alias("column4"))
           .as(SVDPlusPlusResult.encoder());
-      return new Tuple2<>(typed, svd.loss());
+      Dataset<SVDPlusPlusResult> persisted =
+          materializeAndReleaseRaw(rawDF, typed, StorageLevel.MEMORY_AND_DISK());
+      return new Tuple2<>(persisted, svd.loss());
     }
   }
 }

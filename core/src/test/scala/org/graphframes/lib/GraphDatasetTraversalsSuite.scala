@@ -17,6 +17,7 @@
 
 package org.graphframes.lib
 
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrameTestSparkContext
 import org.graphframes.SparkFunSuite
@@ -208,5 +209,77 @@ class GraphDatasetTraversalsSuite extends SparkFunSuite with GraphFrameTestSpark
       .collect()
 
     assert(res.toSet === Set(NeighborAggregateResult(3L, 2, 30)))
+  }
+
+  test("bfs 0-hop works with legacy createEmptyCollectionUsingStringType conf") {
+    val confKey = "spark.sql.legacy.createEmptyCollectionUsingStringType"
+    val prev = spark.conf.getOption(confKey)
+    spark.conf.set(confKey, "true")
+    try {
+      val vv = spark.createDataset(Seq(GraphVertex(1L, Station("A", 1))))
+      val ee = spark.emptyDataset[GraphEdge[Track]]
+      val g = GraphDataset(vv, ee)
+
+      val zeroHop = g.bfs.fromPred(_.id == 1L).toPred(_.id == 1L).run().collect()
+      assert(zeroHop.length === 1)
+      assert(zeroHop.head.length === 0)
+      assert(zeroHop.head.edges.isEmpty)
+    } finally {
+      prev match {
+        case Some(v) => spark.conf.set(confKey, v)
+        case None => spark.conf.unset(confKey)
+      }
+    }
+  }
+
+  test("empty graph traversals, parallel edges dedup, and aggregateNeighbors cache cleanup") {
+    val emptyV = spark.emptyDataset[GraphVertex[Station]]
+    val emptyE = spark.emptyDataset[GraphEdge[Track]]
+    val emptyG = GraphDataset(emptyV, emptyE)
+
+    assert(emptyG.bfs.fromPred(_.id == 1L).toPred(_.id == 2L).run().isEmpty)
+    assert(
+      emptyG.allPaths
+        .fromPred(_.id == 1L)
+        .toPred(_.id == 2L)
+        .setUseLocalCheckpoints(true)
+        .run()
+        .isEmpty)
+
+    // Parallel edges should produce a single SimplePath per topological route
+    val vv =
+      spark.createDataset(Seq(GraphVertex(1L, Station("A", 1)), GraphVertex(2L, Station("B", 1))))
+    val parallelE = spark.createDataset(
+      Seq(GraphEdge(1L, 2L, Track("rail", 1)), GraphEdge(1L, 2L, Track("bus", 2))))
+    val pg = GraphDataset(vv, parallelE)
+    val paths = pg.allPaths
+      .fromPred(_.id == 1L)
+      .toPred(_.id == 2L)
+      .setUseLocalCheckpoints(true)
+      .run()
+      .collect()
+    assert(paths.length === 1)
+
+    // Verify aggregateNeighbors returns persisted result and unpersist leaves zero leaked RDDs
+    val cachedV = vv.cache()
+    val cachedE = parallelE.cache()
+    val _ = (cachedV.count(), cachedE.count())
+    val beforeIds = sc.getPersistentRDDs.keySet
+    val cg = GraphDataset(cachedV, cachedE)
+    try {
+      val aggRes = cg.aggregateNeighbors
+        .setStartingVertices(_.id == 1L)
+        .setMaxHops(2)
+        .setCheckpointInterval(0)
+        .withAccumulator[Int](_ => 0, (s, t) => s + t.attr.distance)
+        .setTargetCondition((_, t) => t.dstId == 2L)
+        .run()
+      assert(aggRes.storageLevel !== StorageLevel.NONE)
+      assert(aggRes.count() === 2L)
+      aggRes.unpersist(blocking = true)
+      assert((sc.getPersistentRDDs.keySet -- beforeIds).isEmpty)
+    } finally {
+      val _ = (cachedV.unpersist(blocking = true), cachedE.unpersist(blocking = true))
+    }
   }
 }

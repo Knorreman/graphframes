@@ -19,15 +19,19 @@ package org.graphframes.lib
 
 import org.apache.spark.ml.feature.Word2Vec
 import org.apache.spark.ml.functions.vector_to_array
+import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.functions.array
+import org.apache.spark.sql.functions.coalesce
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.functions.collect_list
 import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.functions.map_from_entries
 import org.apache.spark.sql.functions.struct
+import org.apache.spark.sql.functions.when
+import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrame
 import org.graphframes.Logging
@@ -42,7 +46,68 @@ import org.graphframes.embeddings.Hash2Vec
 import org.graphframes.embeddings.RandomWalkEmbeddings
 import org.graphframes.rw.RandomWalkBase
 
+import java.util
 import scala.reflect.runtime.universe.TypeTag
+
+private[graphframes] object DatasetCacheUtils {
+
+  /**
+   * Persists and materializes a typed `Dataset` projected from a wrapped `GraphFrame` algorithm
+   * result `DataFrame`, then unpersists `raw` so the intermediate DataFrame does not leak in
+   * Spark's cache manager.
+   */
+  def materializeAndReleaseRaw[T](
+      raw: DataFrame,
+      typed: Dataset[T],
+      storageLevel: StorageLevel): Dataset[T] = {
+    val persisted = typed.persist(storageLevel)
+    var succeeded = false
+    try {
+      val _ = persisted.count()
+      succeeded = true
+      persisted
+    } finally {
+      if (!succeeded) {
+        val _ = persisted.unpersist()
+      }
+      if (raw.storageLevel != StorageLevel.NONE) {
+        val _ = raw.unpersist()
+      }
+      ()
+    }
+  }
+
+  /**
+   * Persists and materializes both vertex and edge datasets projected from a wrapped `GraphFrame`
+   * algorithm result, then unpersists `rawGF` so neither raw DataFrame leaks in Spark's cache
+   * manager.
+   */
+  def materializeGraphAndReleaseRaw[VD: TypeTag, ED: TypeTag](
+      rawGF: GraphFrame,
+      typedVertices: Dataset[GraphVertex[VD]],
+      typedEdges: Dataset[GraphEdge[ED]],
+      storageLevel: StorageLevel): GraphDataset[VD, ED] = {
+    val persistedV = typedVertices.persist(storageLevel)
+    val persistedE = typedEdges.persist(storageLevel)
+    var succeeded = false
+    try {
+      val _ = (persistedV.count(), persistedE.count())
+      succeeded = true
+      GraphDataset(persistedV, persistedE)
+    } finally {
+      if (!succeeded) {
+        val _ = (persistedV.unpersist(), persistedE.unpersist())
+      }
+      if (rawGF.vertices.storageLevel != StorageLevel.NONE) {
+        val _ = rawGF.vertices.unpersist()
+      }
+      if (rawGF.edges.storageLevel != StorageLevel.NONE) {
+        val _ = rawGF.edges.unpersist()
+      }
+      ()
+    }
+  }
+}
 
 /** Vertex attribute augmented with PageRank score. */
 case class PageRankAttr[VD](attr: VD, pagerank: Double) extends Serializable
@@ -98,8 +163,9 @@ class PageRankDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
   }
 
   /**
-   * Runs PageRank and returns a [[GraphDataset]] whose vertex attributes are [[PageRankAttr]] and
-   * edge attributes are [[WeightedEdgeAttr]].
+   * Runs PageRank and returns a persisted and materialized [[GraphDataset]] whose vertex
+   * attributes are [[PageRankAttr]] and edge attributes are [[WeightedEdgeAttr]]. Callers should
+   * call `.unpersist()` on the returned graph when it is no longer needed.
    */
   def run(): GraphDataset[PageRankAttr[VD], WeightedEdgeAttr[ED]] = {
     val pr = graph.toGraphFrame.pageRank.resetProbability(resetProb)
@@ -120,7 +186,10 @@ class PageRankDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
         col(GraphFrame.DST).alias("dstId"),
         struct(col(GraphFrame.ATTR).alias("attr"), col("weight").alias("weight")).alias("attr"))
       .as[GraphEdge[WeightedEdgeAttr[ED]]]
-    GraphDataset(vv, ee)
+    val res =
+      DatasetCacheUtils.materializeGraphAndReleaseRaw(resGF, vv, ee, StorageLevel.MEMORY_AND_DISK)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -129,6 +198,15 @@ case class ShortestPathsResult(id: VertexId, distances: Map[VertexId, Int])
     extends GraphVertexBase[Map[VertexId, Int]] {
   def attr: Map[VertexId, Int] = distances
   def toVertex: GraphVertex[Map[VertexId, Int]] = GraphVertex(id, distances)
+
+  /** Returns the landmark distances as an unmodifiable Java {@code Map}. */
+  def distancesAsJava: util.Map[java.lang.Long, java.lang.Integer] = {
+    val map = new util.HashMap[java.lang.Long, java.lang.Integer](distances.size)
+    distances.foreach { case (k, v) =>
+      val _ = map.put(java.lang.Long.valueOf(k), java.lang.Integer.valueOf(v))
+    }
+    util.Collections.unmodifiableMap(map)
+  }
 }
 
 object ShortestPathsResult {
@@ -156,7 +234,10 @@ class ShortestPathsDataset[VD, ED] private[graphframes] (private val graph: Grap
     this
   }
 
-  /** Runs shortest paths and returns a typed dataset of [[ShortestPathsResult]]. */
+  /**
+   * Runs shortest paths and returns a persisted and materialized dataset of
+   * [[ShortestPathsResult]]. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[ShortestPathsResult] = {
     val lmarksChecked = check(lmarks, "landmarks")
     val sp = graph.toGraphFrame.shortestPaths
@@ -167,9 +248,13 @@ class ShortestPathsDataset[VD, ED] private[graphframes] (private val graph: Grap
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setIsDirected(isDirected)
 
-    sp.run()
+    val rawDF = sp.run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col("distances"))
       .as[ShortestPathsResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -201,16 +286,23 @@ class TriangleCountDataset[VD, ED] private[graphframes] (private val graph: Grap
     this
   }
 
-  /** Runs triangle counting and returns a typed dataset of [[TriangleCountResult]]. */
+  /**
+   * Runs triangle counting and returns a persisted and materialized dataset of
+   * [[TriangleCountResult]]. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[TriangleCountResult] = {
     val tc = graph.toGraphFrame.triangleCount
       .setAlgorithm(algorithm)
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setLgNomEntries(lgNomEntries)
 
-    tc.run()
+    val rawDF = tc.run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col("count").cast("long").alias("count"))
       .as[TriangleCountResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -239,7 +331,10 @@ class LabelPropagationDataset[VD, ED] private[graphframes] (
     with WithIntermediateStorageLevel
     with Logging {
 
-  /** Runs label propagation and returns a typed dataset of [[LabelPropagationResult]]. */
+  /**
+   * Runs label propagation and returns a persisted and materialized dataset of
+   * [[LabelPropagationResult]]. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[LabelPropagationResult] = {
     val maxIterChecked = check(maxIter, "maxIter")
     val lp = graph.toGraphFrame.labelPropagation
@@ -249,9 +344,16 @@ class LabelPropagationDataset[VD, ED] private[graphframes] (
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .setIntermediateStorageLevel(intermediateStorageLevel)
 
-    lp.run()
-      .select(col(GraphFrame.ID).alias("id"), col("label").cast("long").alias("label"))
+    val rawDF = lp.run()
+    // GraphFrames LPA can emit null label for vertices with zero incoming edges
+    val typed = rawDF
+      .select(
+        col(GraphFrame.ID).alias("id"),
+        coalesce(col("label"), col(GraphFrame.ID)).cast("long").alias("label"))
       .as[LabelPropagationResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -266,16 +368,21 @@ class StronglyConnectedComponentsDataset[VD, ED] private[graphframes] (
     with Logging {
 
   /**
-   * Runs strongly connected components and returns a typed dataset of
-   * [[ConnectedComponentResult]].
+   * Runs strongly connected components and returns a persisted and materialized dataset of
+   * [[ConnectedComponentResult]]. Callers should call `.unpersist()` when finished.
    */
   def run(): Dataset[ConnectedComponentResult] = {
     val maxIterChecked = check(maxIter, "maxIter")
-    graph.toGraphFrame.stronglyConnectedComponents
+    val rawDF = graph.toGraphFrame.stronglyConnectedComponents
       .maxIter(maxIterChecked)
       .run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col("component").alias("connectedComponent"))
       .as[ConnectedComponentResult]
+    val res =
+      DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, StorageLevel.MEMORY_AND_DISK)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -299,15 +406,22 @@ class KCoreDataset[VD, ED] private[graphframes] (private val graph: GraphDataset
     with WithCheckpointInterval
     with WithLocalCheckpoints {
 
-  /** Runs K-Core decomposition and returns a typed dataset of [[KCoreResult]]. */
+  /**
+   * Runs K-Core decomposition and returns a persisted and materialized dataset of
+   * [[KCoreResult]]. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[KCoreResult] = {
-    graph.toGraphFrame.kCore
+    val rawDF = graph.toGraphFrame.kCore
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setCheckpointInterval(checkpointInterval)
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col(KCore.kCoreColumnName).alias("kcore"))
       .as[KCoreResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -323,19 +437,23 @@ class MaximalIndependentSetDataset[VD: TypeTag, ED] private[graphframes] (
     with WithLocalCheckpoints {
 
   /**
-   * Runs Maximal Independent Set and returns the typed `Dataset[GraphVertex[VD]]` of vertices in
-   * the independent set.
+   * Runs Maximal Independent Set and returns a persisted and materialized
+   * `Dataset[GraphVertex[VD]]` of vertices in the independent set. Callers should call
+   * `.unpersist()` when finished.
    */
   def run(seed: Long): Dataset[GraphVertex[VD]] = {
-    val misIds = graph.toGraphFrame.maximalIndependentSet
+    val rawMis = graph.toGraphFrame.maximalIndependentSet
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setCheckpointInterval(checkpointInterval)
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .run(seed)
-      .select(col(GraphFrame.ID).alias("id"))
-    graph.vertices
+    val misIds = rawMis.select(col(GraphFrame.ID).alias("id"))
+    val typed = graph.vertices
       .join(misIds, Seq("id"), "left_semi")
       .as[GraphVertex[VD]]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawMis, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -351,17 +469,24 @@ class DetectingCyclesDataset[VD, ED] private[graphframes] (
     with WithLocalCheckpoints
     with WithCheckpointInterval {
 
-  /** Runs cycle detection and returns a typed `Dataset[Seq[VertexId]]` of unique cycles. */
+  /**
+   * Runs cycle detection and returns a persisted and materialized `Dataset[Seq[VertexId]]` of
+   * unique cycles. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[Seq[VertexId]] = {
     val session = graph.spark
     import session.implicits.*
-    graph.toGraphFrame.detectingCycles
+    val rawDF = graph.toGraphFrame.detectingCycles
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setUseLocalCheckpoints(useLocalCheckpoints)
       .setCheckpointInterval(checkpointInterval)
       .run()
+    val typed = rawDF
       .select(col(DetectingCycles.foundSeqCol))
       .as[Seq[VertexId]]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -408,8 +533,9 @@ class ParallelPersonalizedPageRankDataset[VD: TypeTag, ED: TypeTag] private[grap
   }
 
   /**
-   * Runs Parallel Personalized PageRank and returns a [[GraphDataset]] with
-   * [[PersonalizedPageRankAttr]] vertex attributes and [[WeightedEdgeAttr]] edge attributes.
+   * Runs Parallel Personalized PageRank and returns a persisted and materialized [[GraphDataset]]
+   * with [[PersonalizedPageRankAttr]] vertex attributes and [[WeightedEdgeAttr]] edge attributes.
+   * Callers should call `.unpersist()` on the returned graph when finished.
    */
   def run(): GraphDataset[PersonalizedPageRankAttr[VD], WeightedEdgeAttr[ED]] = {
     val maxIterChecked = check(maxIter, "maxIter")
@@ -432,7 +558,10 @@ class ParallelPersonalizedPageRankDataset[VD: TypeTag, ED: TypeTag] private[grap
         col(GraphFrame.DST).alias("dstId"),
         struct(col(GraphFrame.ATTR).alias("attr"), col("weight").alias("weight")).alias("attr"))
       .as[GraphEdge[WeightedEdgeAttr[ED]]]
-    GraphDataset(vv, ee)
+    val res =
+      DatasetCacheUtils.materializeGraphAndReleaseRaw(resGF, vv, ee, StorageLevel.MEMORY_AND_DISK)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -483,32 +612,41 @@ class StructureAwareLabelPropagationDataset[VD, ED] private[graphframes] (
   }
 
   /**
-   * Runs structure-aware label propagation using each vertex's own ID as its initial label.
+   * Runs structure-aware label propagation using each vertex's own ID as its initial label,
+   * returning a persisted and materialized dataset of [[LabelPropagationResult]].
    */
   def run(): Dataset[LabelPropagationResult] = {
-    configure(graph.toGraphFrame)
-      .run()
+    val rawDF = configure(graph.toGraphFrame).run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col("label").cast("long").alias("label"))
       .as[LabelPropagationResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 
   /**
    * Runs attribute-guided structure-aware label propagation initialized from a typed function
-   * `extractLabel` applied to each vertex.
+   * `extractLabel` applied to each vertex, returning a persisted and materialized dataset.
    */
   def runWithInitialLabel[L: TypeTag](
       extractLabel: GraphVertex[VD] => L): Dataset[GraphVertex[L]] = {
     val initCol = "_gf_init_label"
-    val gf = graph.toGraphFrame
     val labeledV = graph.vertices
       .map(v => GraphVertex(v.id, extractLabel(v)))
       .toDF(GraphFrame.ID, initCol)
-    val preparedGF = GraphFrame(labeledV, gf.edges)
-    configure(preparedGF)
+    val eDF =
+      graph.edges.select(col("srcId").alias(GraphFrame.SRC), col("dstId").alias(GraphFrame.DST))
+    val preparedGF = GraphFrame(labeledV, eDF)
+    val rawDF = configure(preparedGF)
       .setInitialLabelCol(initCol)
       .run()
+    val typed = rawDF
       .select(col(GraphFrame.ID).alias("id"), col("label").alias("attr"))
       .as[GraphVertex[L]]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -520,7 +658,7 @@ class StructureAwareLabelPropagationDataset[VD, ED] private[graphframes] (
  * `k` directed hops from `id`.
  */
 case class HyperANFResult(id: VertexId, hopSketches: Seq[Array[Byte]]) extends Serializable {
-  def numHops: Int = hopSketches.size - 1
+  def numHops: Int = math.max(0, hopSketches.size - 1)
 }
 
 object HyperANFResult {
@@ -563,7 +701,10 @@ class HyperANFDataset[VD, ED] private[graphframes] (private val graph: GraphData
     this
   }
 
-  /** Runs HyperANF and returns a typed dataset of [[HyperANFResult]]. */
+  /**
+   * Runs HyperANF and returns a persisted and materialized dataset of [[HyperANFResult]]. Callers
+   * should call `.unpersist()` when finished.
+   */
   def run(): Dataset[HyperANFResult] = {
     val targetGraph = edgePredicate.map(graph.filterEdges).getOrElse(graph)
     val resDF = targetGraph.toGraphFrame.hyperANF
@@ -575,9 +716,12 @@ class HyperANFDataset[VD, ED] private[graphframes] (private val graph: GraphData
       .run()
 
     val hopCols = (0 to nHops).map(h => col(s"hop_$h"))
-    resDF
+    val typed = resDF
       .select(col(GraphFrame.ID).alias("id"), array(hopCols: _*).alias("hopSketches"))
       .as[HyperANFResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(resDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -616,12 +760,14 @@ class RandomWalkEmbeddingsDataset[VD, ED] private[graphframes] (
 
   /** Sets the sequence model (`Left(Word2Vec)` or `Right(Hash2Vec)`). */
   def setSequenceModel(value: Either[Word2Vec, Hash2Vec]): this.type = {
+    require(value != null, "sequenceModel must not be null.")
     sequenceModel = Some(value)
     this
   }
 
   /** Sets the random walk generator. */
   def setRandomWalks(value: RandomWalkBase): this.type = {
+    require(value != null, "randomWalks must not be null.")
     randomWalks = Some(value)
     this
   }
@@ -662,8 +808,14 @@ class RandomWalkEmbeddingsDataset[VD, ED] private[graphframes] (
     this
   }
 
-  /** Runs random-walk node embeddings and returns a typed dataset of [[NodeEmbeddingResult]]. */
+  /**
+   * Runs random-walk node embeddings and returns a persisted and materialized dataset of
+   * [[NodeEmbeddingResult]]. Callers should call `.unpersist()` when finished.
+   */
   def run(): Dataset[NodeEmbeddingResult] = {
+    require(sequenceModel.isDefined, "sequenceModel must be set before calling run().")
+    require(randomWalks.isDefined, "randomWalks must be set before calling run().")
+
     val rw = graph.toGraphFrame.randomWalksBasedEmbedding
       .setIntermediateStorageLevel(intermediateStorageLevel)
       .setSeed(seed)
@@ -675,11 +827,15 @@ class RandomWalkEmbeddingsDataset[VD, ED] private[graphframes] (
     randomWalks.foreach(rw.setRandomWalks)
     cachedRwPath.foreach(rw.useCachedRandomWalks)
 
-    rw.run()
+    val rawDF = rw.run()
+    val typed = rawDF
       .select(
         col(GraphFrame.ID).cast("long").alias("id"),
         vector_to_array(col(RandomWalkEmbeddings.embeddingColName)).alias("embedding"))
       .as[NodeEmbeddingResult]
+    val res = DatasetCacheUtils.materializeAndReleaseRaw(rawDF, typed, intermediateStorageLevel)
+    resultIsPersistent()
+    res
   }
 }
 
@@ -693,7 +849,22 @@ case class SVDPlusPlusResult(
     column2: Seq[Double],
     column3: Double,
     column4: Double)
-    extends Serializable
+    extends Serializable {
+
+  /** Returns `column1` as an unmodifiable Java {@code List<Double>}. */
+  def column1AsJava: util.List[java.lang.Double] = toJavaDoubleList(column1)
+
+  /** Returns `column2` as an unmodifiable Java {@code List<Double>}. */
+  def column2AsJava: util.List[java.lang.Double] = toJavaDoubleList(column2)
+
+  private def toJavaDoubleList(values: Seq[Double]): util.List[java.lang.Double] = {
+    val list = new util.ArrayList[java.lang.Double](values.size)
+    values.foreach { d =>
+      val _ = list.add(java.lang.Double.valueOf(d))
+    }
+    util.Collections.unmodifiableList(list)
+  }
+}
 
 object SVDPlusPlusResult {
   implicit val encoder: Encoder[SVDPlusPlusResult] =
@@ -758,7 +929,8 @@ class SVDPlusPlusDataset[VD, ED] private[graphframes] (private val graph: GraphD
 
   /**
    * Runs SVD++ using `weightExtractor` to extract a rating from each edge attribute `ED`,
-   * returning `(vertexEmbeddings, trainingLoss)`.
+   * returning `(vertexEmbeddings, trainingLoss)` where `vertexEmbeddings` is persisted and
+   * materialized. Callers should call `.unpersist()` on the returned dataset when finished.
    */
   def run(weightExtractor: ED => Double): (Dataset[SVDPlusPlusResult], Double) = {
     val session = graph.spark
@@ -792,7 +964,10 @@ class SVDPlusPlusDataset[VD, ED] private[graphframes] (private val graph: GraphD
         col(SVDPlusPlus.COLUMN4).alias("column4"))
       .as[SVDPlusPlusResult]
 
-    (typed, lossVal)
+    val persisted =
+      DatasetCacheUtils.materializeAndReleaseRaw(resDF, typed, StorageLevel.MEMORY_AND_DISK)
+    resultIsPersistent()
+    (persisted, lossVal)
   }
 
   /**
@@ -834,34 +1009,50 @@ object TypedDegreeResult {
     Encoders.product[TypedDegreeResult[K]]
 }
 
+private[graphframes] case class TypedDegreePair[K](id: VertexId, k: K) extends Serializable
+
+private[graphframes] object TypedDegreePair {
+  implicit def encoder[K: TypeTag]: Encoder[TypedDegreePair[K]] =
+    Encoders.product[TypedDegreePair[K]]
+}
+
+private[graphframes] case class TypedDegreeOptPair[K](id: VertexId, k: Option[K])
+    extends Serializable
+
+private[graphframes] object TypedDegreeOptPair {
+  implicit def encoder[K: TypeTag]: Encoder[TypedDegreeOptPair[K]] =
+    Encoders.product[TypedDegreeOptPair[K]]
+}
+
 private[graphframes] object TypedDegreeMetrics {
   def compute[K: TypeTag](
-      pairs: Dataset[(VertexId, K)],
+      pairs: Dataset[TypedDegreePair[K]],
       edgeTypes: Option[Seq[K]]): Dataset[TypedDegreeResult[K]] = {
-    val pairsDF = pairs.toDF("id", "k")
     edgeTypes match {
       case Some(allowed) =>
-        val allowedList = allowed.distinct
+        val allowedList = allowed.filter(k => Option(k).isDefined).distinct.toVector
         val allowedSet = allowedList.toSet
-        val allIds = pairsDF.select(col("id")).distinct()
-        val filteredCounts = pairs
-          .filter((p: (VertexId, K)) => allowedSet.contains(p._2))
+        pairs
+          .map { p =>
+            val filteredKey = Option(p.k).filter(allowedSet.contains)
+            TypedDegreeOptPair(p.id, filteredKey)
+          }
           .toDF("id", "k")
           .groupBy(col("id"), col("k"))
           .agg(count("*").cast("int").alias("cnt"))
           .groupBy(col("id"))
-          .agg(map_from_entries(collect_list(struct(col("k"), col("cnt")))).alias("degrees"))
-
-        allIds
-          .join(filteredCounts, Seq("id"), "left_outer")
-          .select(col("id"), col("degrees"))
+          .agg(
+            map_from_entries(collect_list(when(col("k").isNotNull, struct(col("k"), col("cnt")))))
+              .alias("degrees"))
           .as[TypedDegreeResult[K]]
           .map { r =>
             val existing = Option(r.degrees).getOrElse(Map.empty[K, Int])
             TypedDegreeResult(r.id, allowedList.map(k => k -> existing.getOrElse(k, 0)).toMap)
           }
       case None =>
-        pairsDF
+        pairs
+          .toDF("id", "k")
+          .filter(col("k").isNotNull)
           .groupBy(col("id"), col("k"))
           .agg(count("*").cast("int").alias("cnt"))
           .groupBy(col("id"))

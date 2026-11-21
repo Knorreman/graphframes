@@ -57,6 +57,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
 
   /** Sends a message to the source vertex of each triplet. */
   public JavaAggregateMessages<VD, ED, M> sendToSrc(MapFunction<GraphTriplet<VD, ED>, M> fn) {
+    Objects.requireNonNull(fn, "sendToSrc function must not be null");
     senders.add(t -> Collections.singletonList(new Tuple2<>(t.srcId(), fn.call(t))).iterator());
     return this;
   }
@@ -64,6 +65,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
   /** Conditionally sends a message to the source vertex of each triplet. */
   public JavaAggregateMessages<VD, ED, M> sendToSrcOpt(
       MapFunction<GraphTriplet<VD, ED>, Optional<M>> fn) {
+    Objects.requireNonNull(fn, "sendToSrcOpt function must not be null");
     senders.add(t -> {
       Optional<M> opt = fn.call(t);
       return opt.map(m -> Collections.singletonList(new Tuple2<>(t.srcId(), m)).iterator())
@@ -74,6 +76,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
 
   /** Sends a message to the destination vertex of each triplet. */
   public JavaAggregateMessages<VD, ED, M> sendToDst(MapFunction<GraphTriplet<VD, ED>, M> fn) {
+    Objects.requireNonNull(fn, "sendToDst function must not be null");
     senders.add(t -> Collections.singletonList(new Tuple2<>(t.dstId(), fn.call(t))).iterator());
     return this;
   }
@@ -81,6 +84,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
   /** Conditionally sends a message to the destination vertex of each triplet. */
   public JavaAggregateMessages<VD, ED, M> sendToDstOpt(
       MapFunction<GraphTriplet<VD, ED>, Optional<M>> fn) {
+    Objects.requireNonNull(fn, "sendToDstOpt function must not be null");
     senders.add(t -> {
       Optional<M> opt = fn.call(t);
       return opt.map(m -> Collections.singletonList(new Tuple2<>(t.dstId(), m)).iterator())
@@ -92,6 +96,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
   /** Sends zero or more {@code (targetVertexId, message)} pairs for each triplet. */
   public JavaAggregateMessages<VD, ED, M> sendMsg(
       FlatMapFunction<GraphTriplet<VD, ED>, Tuple2<Long, M>> fn) {
+    Objects.requireNonNull(fn, "sendMsg function must not be null");
     senders.add(fn);
     return this;
   }
@@ -122,6 +127,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
 
   /** Reduces messages sent to each vertex using {@code mergeMsg}. */
   public Dataset<Tuple2<Long, M>> agg(ReduceFunction<M> mergeMsg) {
+    Objects.requireNonNull(mergeMsg, "mergeMsg must not be null");
     return buildRawMessages()
         .groupByKey((MapFunction<Tuple2<Long, M>, Long>) Tuple2::_1, Encoders.LONG())
         .mapValues((MapFunction<Tuple2<Long, M>, M>) Tuple2::_2, msgEncoder)
@@ -130,6 +136,7 @@ public final class JavaAggregateMessages<VD, ED, M> implements Serializable {
 
   /** Aggregates messages sent to each vertex using a typed Spark {@code Aggregator}. */
   public <R> Dataset<Tuple2<Long, R>> agg(Aggregator<M, ?, R> aggregator) {
+    Objects.requireNonNull(aggregator, "aggregator must not be null");
     return buildRawMessages()
         .groupByKey((MapFunction<Tuple2<Long, M>, Long>) Tuple2::_1, Encoders.LONG())
         .mapValues((MapFunction<Tuple2<Long, M>, M>) Tuple2::_2, msgEncoder)

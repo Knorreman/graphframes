@@ -19,6 +19,7 @@ package org.graphframes.lib
 
 import org.apache.spark.graphframes.graphx.EdgeDirection
 import org.apache.spark.graphframes.graphx.EdgeTriplet
+import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.Encoders
@@ -84,9 +85,10 @@ class PregelGraphDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
   /**
    * Sets the number of iterations between two checkpoints (default: 2).
    *
-   * Checkpoint is disabled if this is set to 0.
+   * Checkpointing is disabled when set to 0.
    */
   def setCheckpointInterval(value: Int): this.type = {
+    require(value >= 0, s"checkpointInterval must be >= 0, but got $value.")
     checkpointInterval = value
     this
   }
@@ -99,6 +101,7 @@ class PregelGraphDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
    * (default: `EdgeDirection.Either`).
    */
   def setActiveDirection(value: EdgeDirection): this.type = {
+    require(value != null, "activeDirection must not be null.")
     activeDirection = value
     this
   }
@@ -271,6 +274,12 @@ object PregelGraphDataset extends Logging {
    * On the first iteration all vertices receive `initialMsg`. On subsequent iterations `vprog` is
    * invoked only on vertices that received at least one message. Execution continues until no
    * messages are sent or `maxIterations` iterations have completed.
+   *
+   * Note: Unlike the fluent `graph.pregel` builder (which defaults `checkpointInterval` to `2`
+   * matching [[Pregel]]), this direct helper defaults `checkpointInterval` to `0` (disabled). The
+   * returned graph has a persisted and materialized `vertices` dataset and reuses `graph.edges`;
+   * call `result.vertices.unpersist()` (rather than `result.unpersist()`) when finished so
+   * caller-cached input edges remain cached.
    */
   def run[VD: TypeTag, ED: TypeTag, A: Encoder](
       graph: GraphDataset[VD, ED],
@@ -301,6 +310,12 @@ object PregelGraphDataset extends Logging {
   /**
    * Execute a typed Pregel-like iterative vertex-parallel computation on a [[GraphDataset]] using
    * typed [[GraphTriplet]] in `sendMsg`.
+   *
+   * Note: Unlike the fluent `graph.pregel` builder (which defaults `checkpointInterval` to `2`
+   * matching [[Pregel]]), this direct helper defaults `checkpointInterval` to `0` (disabled). The
+   * returned graph has a persisted and materialized `vertices` dataset and reuses `graph.edges`;
+   * call `result.vertices.unpersist()` (rather than `result.unpersist()`) when finished so
+   * caller-cached input edges remain cached.
    */
   def runTriplets[VD: TypeTag, ED: TypeTag, A: Encoder](
       graph: GraphDataset[VD, ED],
@@ -317,6 +332,10 @@ object PregelGraphDataset extends Logging {
     require(
       maxIterations > 0,
       s"Maximum number of iterations must be greater than 0, but got $maxIterations.")
+    require(
+      checkpointInterval >= 0,
+      s"checkpointInterval must be >= 0, but got $checkpointInterval.")
+    require(activeDirection != null, "activeDirection must not be null.")
 
     val spark = graph.spark
     val shouldCheckpoint = checkpointInterval > 0
@@ -339,7 +358,7 @@ object PregelGraphDataset extends Logging {
 
       def buildActiveTriplets(
           vv: Dataset[ActiveGraphVertex[VD]],
-          ee: Dataset[GraphEdge[ED]],
+          ee: DataFrame,
           filterActive: Boolean): Dataset[GraphTriplet[VD, ED]] = {
         val srcV = {
           val base =
@@ -361,7 +380,6 @@ object PregelGraphDataset extends Logging {
         }
 
         val joined = ee
-          .toDF("srcId", "dstId", "attr")
           .join(srcV, Seq("srcId"), "inner")
           .join(dstV, Seq("dstId"), "inner")
 
@@ -386,73 +404,102 @@ object PregelGraphDataset extends Logging {
       }
 
       spark.sparkContext.setJobDescription(s"$jobDescriptionPrefix: initialization")
-      val cachedEdges = graph.edges.persist(intermediateStorageLevel)
-      var currentVertices: Dataset[ActiveGraphVertex[VD]] = graph.vertices
-        .map(v => ActiveGraphVertex(v.id, vprog(v.id, v.attr, initialMsg), active = true))
+      val cachedEdgesDF = graph.edges
+        .toDF("srcId", "dstId", "attr")
+        .repartition(col("srcId"))
         .persist(intermediateStorageLevel)
-
-      var messages: Dataset[(VertexId, A)] =
-        computeMessages(buildActiveTriplets(currentVertices, cachedEdges, filterActive = false))
-          .persist(intermediateStorageLevel)
-
-      var hasMessages = !messages.isEmpty
-      var iteration = 0
+      var currentVertices: Dataset[ActiveGraphVertex[VD]] = null
+      var messages: Dataset[(VertexId, A)] = null
+      var prevVertices: Dataset[ActiveGraphVertex[VD]] = null
+      var prevMessages: Dataset[(VertexId, A)] = null
+      var finalVertices: Dataset[GraphVertex[VD]] = null
+      var succeeded = false
 
       try {
+        currentVertices = graph.vertices
+          .map(v => ActiveGraphVertex(v.id, vprog(v.id, v.attr, initialMsg), active = true))
+          .persist(intermediateStorageLevel)
+
+        messages = computeMessages(
+          buildActiveTriplets(currentVertices, cachedEdgesDF, filterActive = false))
+          .persist(intermediateStorageLevel)
+
+        var hasMessages = messages.count() > 0
+        var iteration = 0
+
         while (hasMessages && iteration < maxIterations) {
           spark.sparkContext.setJobDescription(
             s"$jobDescriptionPrefix: iteration ${iteration + 1}$maxIterSuffix")
-          val prevVertices = currentVertices
-          val prevMessages = messages
+          prevVertices = currentVertices
+          prevMessages = messages
 
+          val msgKeyCol = prevMessages.col(prevMessages.columns.head)
           val updated: Dataset[ActiveGraphVertex[VD]] = prevVertices
-            .joinWith(prevMessages, prevVertices("id") === prevMessages("key"), "left_outer")
+            .joinWith(prevMessages, prevVertices("id") === msgKeyCol, "left_outer")
             .map {
               case (v, null) => ActiveGraphVertex(v.id, v.attr, active = false)
               case (v, (_, msg)) =>
                 ActiveGraphVertex(v.id, vprog(v.id, v.attr, msg), active = true)
             }
 
-          val maybeCheckpointed =
-            if (shouldCheckpoint && (iteration + 1) % checkpointInterval == 0) {
-              if (useLocalCheckpoints) {
-                updated.localCheckpoint(eager = true)
-              } else {
-                updated.checkpoint(eager = true)
-              }
+          val isCkptIter = shouldCheckpoint && (iteration + 1) % checkpointInterval == 0
+          val didLocalCkpt = isCkptIter && useLocalCheckpoints
+          currentVertices = if (isCkptIter) {
+            if (useLocalCheckpoints) {
+              updated.localCheckpoint(eager = true)
             } else {
-              updated
+              updated.checkpoint(eager = true).persist(intermediateStorageLevel)
             }
-
-          currentVertices = maybeCheckpointed.persist(intermediateStorageLevel)
+          } else {
+            updated.persist(intermediateStorageLevel)
+          }
 
           if (iteration + 1 < maxIterations) {
             messages = computeMessages(
-              buildActiveTriplets(currentVertices, cachedEdges, filterActive = true))
+              buildActiveTriplets(currentVertices, cachedEdgesDF, filterActive = true))
               .persist(intermediateStorageLevel)
-            hasMessages = !messages.isEmpty
+            hasMessages = messages.count() > 0
           } else {
-            val _ = currentVertices.isEmpty
+            if (!didLocalCkpt) {
+              val _ = currentVertices.count()
+            }
+            messages = null
             hasMessages = false
           }
 
-          prevMessages.unpersist()
-          prevVertices.unpersist()
+          val _ = (prevMessages.unpersist(), prevVertices.unpersist())
+          prevMessages = null
+          prevVertices = null
           iteration += 1
         }
+
+        spark.sparkContext.setJobDescription(s"$jobDescriptionPrefix: materializing final result")
+        finalVertices = currentVertices
+          .map(v => GraphVertex(v.id, v.attr))
+          .persist(intermediateStorageLevel)
+        val _ = finalVertices.count()
+        succeeded = true
+        resultIsPersistent()
+        GraphDataset(finalVertices, graph.edges)
       } finally {
-        messages.unpersist()
-        cachedEdges.unpersist()
+        if (!succeeded && finalVertices != null) {
+          val _ = finalVertices.unpersist()
+        }
+        if (prevMessages != null) {
+          val _ = prevMessages.unpersist()
+        }
+        if (prevVertices != null) {
+          val _ = prevVertices.unpersist()
+        }
+        if (messages != null) {
+          val _ = messages.unpersist()
+        }
+        if (currentVertices != null) {
+          val _ = currentVertices.unpersist()
+        }
+        cachedEdgesDF.unpersist()
         ()
       }
-
-      spark.sparkContext.setJobDescription(s"$jobDescriptionPrefix: materializing final result")
-      val finalVertices = currentVertices
-        .map(v => GraphVertex(v.id, v.attr))
-        .persist(intermediateStorageLevel)
-      val _ = finalVertices.count()
-      currentVertices.unpersist()
-      GraphDataset(finalVertices, graph.edges)
     }
   }
 }

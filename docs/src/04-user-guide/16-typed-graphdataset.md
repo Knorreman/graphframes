@@ -1,9 +1,9 @@
-# Typed GraphDataset API (Scala)
+# Typed GraphDataset API
 
 `GraphDataset[VD, ED]` is a strongly typed Scala API backed by Spark `Dataset`s of
 `GraphVertex[VD]` and `GraphEdge[ED]`. It combines compile-time type safety for vertex and edge
-attributes with Spark SQL's Catalyst optimizer and full interoperability with `GraphFrame` and
-GraphX.
+attributes with Spark SQL's Catalyst optimizer and full interoperability with `GraphFrame`,
+GraphX, and Java (`JavaGraphDataset`).
 
 For full API details, refer to the @:scaladoc(org.graphframes.GraphDataset).
 
@@ -37,7 +37,8 @@ val g: GraphDataset[Person, Relation] = GraphDataset(vertices, edges)
 ```
 
 You can also construct a `GraphDataset` directly from edges (inferring distinct vertex IDs with a
-default vertex attribute):
+required default vertex attribute; note that `fromGraphFrame` requires integral vertex/edge IDs and
+`attr` columns):
 
 ```scala
 val gFromEdges = GraphDataset.fromEdges(edges, defaultVertexAttribute = Person("Unknown", 0))
@@ -72,11 +73,13 @@ val sub = g.subgraph(vpred = _.attr.age >= 32, epred = _.attr.kind == "friend")
 val connectedOnly = g.dropIsolatedVertices()
 
 // Typed attribute transformations
+// Note: mapTriplets uses triplets (inner join on vertices), omitting edges with missing endpoints
 val ages = g.mapVertices((_, person) => person.age)
 val weights = g.mapEdges(e => e.attr.weight)
 val descriptions = g.mapTriplets(t => s"${t.srcAttr.name} -> ${t.dstAttr.name}")
 
 // Graph utilities
+// Note: asUndirected adds a reverse edge for every directed edge (doubling self-loops)
 val reversed = g.asReversed()
 val undirected = g.asUndirected()
 g.validate()
@@ -141,6 +144,7 @@ val result = g
 // Using GraphTriplet[VD, ED]
 val shortest = weightedGraph.pregel
   .setMaxIter(10)
+  .setUseLocalCheckpoints(true)
   .setActiveDirection(EdgeDirection.Out)
   .runTriplets[Int](Int.MaxValue)(
     vprog = (_, dist, msg) => math.min(dist, msg),
@@ -228,7 +232,7 @@ val ppr = g.parallelPersonalizedPageRank.sourceIds(Seq(1L, 2L)).maxIter(5).run()
 val salp = g.structureAwareLabelPropagation.maxIter(5).setUseLocalCheckpoints(true).run()
 
 // HyperANF -> Dataset[HyperANFResult]
-val anf = g.hyperANF.setNHops(3).run()
+val anf = g.hyperANF.setNHops(3).setUseLocalCheckpoints(true).run()
 
 // Random-Walk Node Embeddings -> Dataset[NodeEmbeddingResult]
 val emb = g.randomWalksBasedEmbedding.setRandomWalks(rw).setSequenceModel(Right(h2v)).run()
@@ -244,6 +248,18 @@ val outByKind = g.typeOutDegree(_.kind)
 val inByKind = g.typeInDegree(_.kind, edgeTypes = Some(Seq("friend", "follow")))
 val degByKind = g.typeDegree(_.kind)
 ```
+
+## Persistence and Memory Management
+
+- All standard graph algorithms (`connectedComponents`, `pageRank`, `shortestPaths`,
+  `triangleCount`, `labelPropagation`, `stronglyConnectedComponents`, `kCore`,
+  `maximalIndependentSet`, `detectingCycles`, `parallelPersonalizedPageRank`,
+  `structureAwareLabelPropagation`, `hyperANF`, `randomWalksBasedEmbedding`, `svdPlusPlus`) and
+  `aggregateNeighbors` return persisted and materialized results. Call `.unpersist()` on the
+  returned `Dataset` or `GraphDataset` when finished.
+- `pregel` returns a graph whose `vertices` dataset is persisted and materialized while `edges`
+  reuses the input graph's `edges`. Call `result.vertices.unpersist()` (rather than
+  `result.unpersist()`) so caller-cached input edges remain cached.
 
 ## Saving and Loading
 
@@ -302,6 +318,14 @@ JavaGraphDataset<Integer, Relation> maxAges = g
         : Optional.empty())
     .mergeMsg(Math::max)
     .run();
+
+// Call maxAges.vertices().unpersist() when finished
+maxAges.vertices().show();
+maxAges.vertices().unpersist();
 ```
+
+Result helper methods such as `SimplePath.pathAsJava()`, `ShortestPathsResult.distancesAsJava()`,
+and `SVDPlusPlusResult.column1AsJava()` / `column2AsJava()` expose unmodifiable Java `List`/`Map`
+views alongside the Scala properties.
 
 See `org.graphframes.examples.GraphDatasetExample` for a complete runnable Java example.

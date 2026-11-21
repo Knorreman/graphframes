@@ -23,7 +23,7 @@ import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.functions.array
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.functions.struct
-import org.apache.spark.sql.types.ArrayType
+import org.apache.spark.sql.functions.typedLit
 import org.apache.spark.storage.StorageLevel
 import org.graphframes.GraphDataset
 import org.graphframes.GraphFrame
@@ -34,6 +34,7 @@ import org.graphframes.WithIntermediateStorageLevel
 import org.graphframes.WithLocalCheckpoints
 
 import java.io.IOException
+import java.util
 import scala.reflect.runtime.universe.TypeTag
 
 /**
@@ -143,19 +144,20 @@ class BFSDataset[VD: TypeTag, ED: TypeTag] private[graphframes] (
       return spark.emptyDataset[GraphPath[VD, ED]]
     }
 
-    val edgeCols = cols.filter(c => c.startsWith("e") && c.drop(1).forall(_.isDigit))
+    val edgeCols =
+      cols.filter(c => c.startsWith("e") && c.length > 1 && c.drop(1).forall(_.isDigit))
     if (edgeCols.isEmpty) {
       // 0-hop paths: from == to
-      val edgeElemSchema = spark.emptyDataset[GraphEdge[ED]].schema
       resDF
         .select(
           array(struct(col("from.id").alias("id"), col("from.attr").alias("attr")))
             .alias("vertices"),
-          array().cast(ArrayType(edgeElemSchema)).alias("edges"))
+          typedLit(Seq.empty[GraphEdge[ED]]).alias("edges"))
         .as[GraphPath[VD, ED]]
     } else {
       val vertexCols = cols.filter(c =>
-        c == "from" || c == "to" || (c.startsWith("v") && c.drop(1).forall(_.isDigit)))
+        c == "from" || c == "to" ||
+          (c.startsWith("v") && c.length > 1 && c.drop(1).forall(_.isDigit)))
       val verticesExpr = array(
         vertexCols
           .map(c => struct(col(s"$c.id").alias("id"), col(s"$c.attr").alias("attr")))
@@ -186,6 +188,15 @@ case class SimplePath(path: Seq[VertexId], length: Int) extends Serializable {
 
   /** The destination vertex ID. */
   def to: VertexId = path.last
+
+  /** Returns the ordered vertex IDs in this path as an unmodifiable Java {@code List}. */
+  def pathAsJava: util.List[java.lang.Long] = {
+    val list = new util.ArrayList[java.lang.Long](path.size)
+    path.foreach { id =>
+      val _ = list.add(java.lang.Long.valueOf(id))
+    }
+    util.Collections.unmodifiableList(list)
+  }
 }
 
 object SimplePath {
@@ -253,8 +264,9 @@ class AllPathsDataset[VD, ED] private[graphframes] (private val graph: GraphData
       .toDF(GraphFrame.ID, fromCol, toCol)
 
     val filteredEdges = edgePredicate.map(graph.edges.filter).getOrElse(graph.edges)
-    val eDF =
-      filteredEdges.select(col("srcId").alias(GraphFrame.SRC), col("dstId").alias(GraphFrame.DST))
+    val eDF = filteredEdges
+      .select(col("srcId").alias(GraphFrame.SRC), col("dstId").alias(GraphFrame.DST))
+      .distinct()
 
     GraphFrame(vDF, eDF).allPaths
       .fromExpr(col(fromCol))
@@ -428,8 +440,9 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
   }
 
   /**
-   * Executes the breadth-first neighbor aggregation and returns a typed
-   * `Dataset[NeighborAggregateResult[S]]`.
+   * Executes the breadth-first neighbor aggregation and returns a persisted and materialized
+   * `Dataset[NeighborAggregateResult[S]]`. Callers should call `.unpersist()` on the returned
+   * dataset when it is no longer needed.
    */
   def run(): Dataset[NeighborAggregateResult[S]] = {
     require(
@@ -455,32 +468,40 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
     val semiTriplets = filteredEdges
       .toDF("srcId", "dstId", "edgeAttr")
       .join(graph.vertices.toDF("dstId", "dstAttr"), Seq("dstId"), "inner")
+      .repartition(col("srcId"))
       .persist(intermediateStorageLevel)
 
-    var states: Dataset[TraversalFrontierState[VD, S]] = graph.vertices
-      .filter(startingPredicate)
-      .map(v => TraversalFrontierState(v.id, v.attr, init(v)))
-      .persist(intermediateStorageLevel)
-
-    var finished: Dataset[NeighborAggregateResult[S]] =
-      spark.emptyDataset[NeighborAggregateResult[S]].persist(intermediateStorageLevel)
-
+    val initFn = init
     val stopFnOpt = stoppingCond
     val targetFnOpt = targetCond
     val updateFn = update
     val hasTarget = targetFnOpt.isDefined
 
-    var iter = 0
-    var converged = states.isEmpty
+    var states: Dataset[TraversalFrontierState[VD, S]] = null
+    var finished: Dataset[NeighborAggregateResult[S]] = null
+    var prevStates: Dataset[TraversalFrontierState[VD, S]] = null
+    var prevFinished: Dataset[NeighborAggregateResult[S]] = null
+    var transitions: Dataset[TraversalTransition[VD, S]] = null
+    var succeeded = false
 
     try {
+      states = graph.vertices
+        .filter(startingPredicate)
+        .map(v => TraversalFrontierState(v.id, v.attr, initFn(v)))
+        .persist(intermediateStorageLevel)
+
+      finished = spark.emptyDataset[NeighborAggregateResult[S]].persist(intermediateStorageLevel)
+
+      var iter = 0
+      var converged = states.count() == 0
+
       while (!converged && iter < maxHops) {
         iter += 1
         val currentHop = iter
-        val prevStates = states
-        val prevFinished = finished
+        prevStates = states
+        prevFinished = finished
 
-        val transitions = prevStates
+        transitions = prevStates
           .toDF("srcId", "srcAttr", "acc")
           .join(semiTriplets, Seq("srcId"), "inner")
           .select(
@@ -530,19 +551,41 @@ class TypedAggregateNeighborsBuilder[VD: TypeTag, ED: TypeTag, S: TypeTag] priva
         states = maybeCkptStates.persist(intermediateStorageLevel)
         finished = maybeCkptFinished.persist(intermediateStorageLevel)
 
-        val _ = finished.count()
-        converged = states.isEmpty
+        converged = {
+          val _ = finished.count()
+          states.count() == 0
+        }
 
-        transitions.unpersist()
-        prevStates.unpersist()
-        prevFinished.unpersist()
+        val _ = (transitions.unpersist(), prevStates.unpersist(), prevFinished.unpersist())
+        transitions = null
+        prevStates = null
+        prevFinished = null
       }
+
+      if (iter == 0) {
+        val _ = finished.count()
+      }
+      succeeded = true
+      resultIsPersistent()
+      finished
     } finally {
-      states.unpersist()
+      if (!succeeded && finished != null) {
+        val _ = finished.unpersist()
+      }
+      if (prevFinished != null) {
+        val _ = prevFinished.unpersist()
+      }
+      if (transitions != null) {
+        val _ = transitions.unpersist()
+      }
+      if (prevStates != null) {
+        val _ = prevStates.unpersist()
+      }
+      if (states != null) {
+        val _ = states.unpersist()
+      }
       semiTriplets.unpersist()
       ()
     }
-
-    finished
   }
 }

@@ -22,6 +22,7 @@ import org.apache.spark.api.java.function.Function3;
 import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.api.java.function.ReduceFunction;
 import org.apache.spark.graphframes.graphx.EdgeDirection;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
@@ -36,6 +37,7 @@ import scala.Tuple5;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -51,12 +53,15 @@ import java.util.Optional;
  */
 public final class JavaPregel<VD, ED> implements Serializable {
 
+  private static final String JOB_DESCRIPTION_KEY = "spark.job.description";
+
   private final JavaGraphDataset<VD, ED> graph;
   private int maxIter = 10;
   private int checkpointInterval = 2;
   private EdgeDirection activeDirection = EdgeDirection.Either();
   private boolean useLocalCheckpoints = false;
   private StorageLevel intermediateStorageLevel = StorageLevel.MEMORY_AND_DISK();
+  private String jobDescriptionPrefix = "GraphFrames JavaPregel";
 
   public JavaPregel(JavaGraphDataset<VD, ED> graph) {
     this.graph = Objects.requireNonNull(graph, "graph must not be null");
@@ -72,6 +77,9 @@ public final class JavaPregel<VD, ED> implements Serializable {
   }
 
   public JavaPregel<VD, ED> setCheckpointInterval(int value) {
+    if (value < 0) {
+      throw new IllegalArgumentException("checkpointInterval must be >= 0, but got " + value);
+    }
     this.checkpointInterval = value;
     return this;
   }
@@ -92,6 +100,16 @@ public final class JavaPregel<VD, ED> implements Serializable {
     return this;
   }
 
+  public JavaPregel<VD, ED> setJobDescriptionPrefix(String value) {
+    this.jobDescriptionPrefix =
+        Objects.requireNonNull(value, "jobDescriptionPrefix must not be null");
+    return this;
+  }
+
+  public String getJobDescriptionPrefix() {
+    return jobDescriptionPrefix;
+  }
+
   /** Starts a typed Pregel builder for message type {@code A}. */
   public <A> Builder<VD, ED, A> withMessages(A initialMsg, Encoder<A> msgEncoder) {
     return new Builder<>(
@@ -102,7 +120,8 @@ public final class JavaPregel<VD, ED> implements Serializable {
         checkpointInterval,
         activeDirection,
         useLocalCheckpoints,
-        intermediateStorageLevel);
+        intermediateStorageLevel,
+        jobDescriptionPrefix);
   }
 
   /**
@@ -117,6 +136,7 @@ public final class JavaPregel<VD, ED> implements Serializable {
     private final EdgeDirection activeDirection;
     private final boolean useLocalCheckpoints;
     private final StorageLevel storageLevel;
+    private final String jobDescriptionPrefix;
 
     private Function3<Long, VD, A, VD> vertexProgram;
     private ReduceFunction<A> messageCombiner;
@@ -131,7 +151,8 @@ public final class JavaPregel<VD, ED> implements Serializable {
         int checkpointInterval,
         EdgeDirection activeDirection,
         boolean useLocalCheckpoints,
-        StorageLevel storageLevel) {
+        StorageLevel storageLevel,
+        String jobDescriptionPrefix) {
       this.graph = graph;
       this.initialMsg = initialMsg;
       this.msgEncoder = Objects.requireNonNull(msgEncoder, "msgEncoder must not be null");
@@ -140,22 +161,25 @@ public final class JavaPregel<VD, ED> implements Serializable {
       this.activeDirection = activeDirection;
       this.useLocalCheckpoints = useLocalCheckpoints;
       this.storageLevel = storageLevel;
+      this.jobDescriptionPrefix = jobDescriptionPrefix;
     }
 
     /** Sets the vertex program {@code (vertexId, currentAttr, aggregatedMsg) -> newAttr}. */
     public Builder<VD, ED, A> vprog(Function3<Long, VD, A, VD> fn) {
-      this.vertexProgram = fn;
+      this.vertexProgram = Objects.requireNonNull(fn, "vprog function must not be null");
       return this;
     }
 
     /** Sends a message to the destination vertex of each active triplet. */
     public Builder<VD, ED, A> sendMsgToDst(MapFunction<GraphTriplet<VD, ED>, A> fn) {
+      Objects.requireNonNull(fn, "sendMsgToDst function must not be null");
       senders.add(t -> Collections.singletonList(new Tuple2<>(t.dstId(), fn.call(t))).iterator());
       return this;
     }
 
     /** Conditionally sends a message to the destination vertex of each active triplet. */
     public Builder<VD, ED, A> sendMsgToDstOpt(MapFunction<GraphTriplet<VD, ED>, Optional<A>> fn) {
+      Objects.requireNonNull(fn, "sendMsgToDstOpt function must not be null");
       senders.add(t -> {
         Optional<A> opt = fn.call(t);
         return opt.map(m -> Collections.singletonList(new Tuple2<>(t.dstId(), m)).iterator())
@@ -166,12 +190,14 @@ public final class JavaPregel<VD, ED> implements Serializable {
 
     /** Sends a message to the source vertex of each active triplet. */
     public Builder<VD, ED, A> sendMsgToSrc(MapFunction<GraphTriplet<VD, ED>, A> fn) {
+      Objects.requireNonNull(fn, "sendMsgToSrc function must not be null");
       senders.add(t -> Collections.singletonList(new Tuple2<>(t.srcId(), fn.call(t))).iterator());
       return this;
     }
 
     /** Conditionally sends a message to the source vertex of each active triplet. */
     public Builder<VD, ED, A> sendMsgToSrcOpt(MapFunction<GraphTriplet<VD, ED>, Optional<A>> fn) {
+      Objects.requireNonNull(fn, "sendMsgToSrcOpt function must not be null");
       senders.add(t -> {
         Optional<A> opt = fn.call(t);
         return opt.map(m -> Collections.singletonList(new Tuple2<>(t.srcId(), m)).iterator())
@@ -182,18 +208,25 @@ public final class JavaPregel<VD, ED> implements Serializable {
 
     /** Sends zero or more {@code (targetVertexId, message)} pairs for each active triplet. */
     public Builder<VD, ED, A> sendMsg(FlatMapFunction<GraphTriplet<VD, ED>, Tuple2<Long, A>> fn) {
+      Objects.requireNonNull(fn, "sendMsg function must not be null");
       senders.add(fn);
       return this;
     }
 
     /** Sets the associative, commutative function merging two messages for the same vertex. */
     public Builder<VD, ED, A> mergeMsg(ReduceFunction<A> fn) {
-      this.messageCombiner = fn;
+      this.messageCombiner = Objects.requireNonNull(fn, "mergeMsg function must not be null");
       return this;
     }
 
-    /** Executes the Pregel computation and returns the updated {@link JavaGraphDataset}. */
-    public JavaGraphDataset<VD, ED> run() throws IOException {
+    /**
+     * Executes the Pregel computation and returns the updated {@link JavaGraphDataset}.
+     *
+     * <p>The returned graph has a persisted and materialized {@code vertices()} dataset and reuses
+     * {@code graph.edges()}; callers should call {@code result.vertices().unpersist()} (rather than
+     * {@code result.unpersist()}) when finished so caller-cached input edges remain cached.
+     */
+    public JavaGraphDataset<VD, ED> run() {
       if (vertexProgram == null) {
         throw new IllegalArgumentException("vprog must be set before calling run().");
       }
@@ -213,9 +246,9 @@ public final class JavaPregel<VD, ED> implements Serializable {
         if (confDir.isDefined()) {
           spark.sparkContext().setCheckpointDir(confDir.get());
         } else {
-          throw new IOException(
+          throw new UncheckedIOException(new IOException(
               "Checkpoint directory is not set. Please set it first using sc.setCheckpointDir() "
-                  + "or enable local checkpoints via setUseLocalCheckpoints(true).");
+                  + "or enable local checkpoints via setUseLocalCheckpoints(true)."));
         }
       }
 
@@ -232,33 +265,51 @@ public final class JavaPregel<VD, ED> implements Serializable {
       List<FlatMapFunction<GraphTriplet<VD, ED>, Tuple2<Long, A>>> senderFns =
           new ArrayList<>(senders);
 
-      Dataset<Tuple3<Long, Long, ED>> cachedEdges = graph.edges().persist(storageLevel);
-      Dataset<Tuple3<Long, VD, Boolean>> currentVertices = graph.vertices()
-          .map(
-              (MapFunction<Tuple2<Long, VD>, Tuple3<Long, VD, Boolean>>)
-                  v -> new Tuple3<>(v._1(), vp.call(v._1(), v._2(), initMsg), true),
-              activeVertexEnc)
-          .persist(storageLevel);
+      String previousJobDescription = spark.sparkContext().getLocalProperty(JOB_DESCRIPTION_KEY);
+      String maxIterSuffix = maxIterations == Integer.MAX_VALUE ? "" : " / " + maxIterations;
 
-      Dataset<Tuple2<Long, A>> messages = computeMessages(
-          buildActiveTriplets(currentVertices, cachedEdges, false, tripletEnc),
-          senderFns,
-          mm,
-          msgPairEnc,
-          msgEncoder)
-          .persist(storageLevel);
-
-      boolean hasMessages = !messages.isEmpty();
-      int iteration = 0;
+      Dataset<Row> cachedEdgesDF = null;
+      Dataset<Tuple3<Long, VD, Boolean>> currentVertices = null;
+      Dataset<Tuple2<Long, A>> messages = null;
+      Dataset<Tuple3<Long, VD, Boolean>> prevVertices = null;
+      Dataset<Tuple2<Long, A>> prevMessages = null;
+      Dataset<Tuple2<Long, VD>> finalVertices = null;
+      boolean succeeded = false;
 
       try {
-        while (hasMessages && iteration < maxIterations) {
-          Dataset<Tuple3<Long, VD, Boolean>> prevVertices = currentVertices;
-          Dataset<Tuple2<Long, A>> prevMessages = messages;
+        spark.sparkContext().setJobDescription(jobDescriptionPrefix + ": initialization");
+        cachedEdgesDF = graph.edges()
+            .toDF("srcId", "dstId", "attr")
+            .repartition(functions.col("srcId"))
+            .persist(storageLevel);
 
+        currentVertices = graph.vertices()
+            .map(
+                (MapFunction<Tuple2<Long, VD>, Tuple3<Long, VD, Boolean>>)
+                    v -> new Tuple3<>(v._1(), vp.call(v._1(), v._2(), initMsg), true),
+                activeVertexEnc)
+            .persist(storageLevel);
+
+        messages = computeMessages(
+            buildActiveTriplets(currentVertices, cachedEdgesDF, false, tripletEnc),
+            senderFns,
+            mm,
+            msgPairEnc,
+            msgEncoder)
+            .persist(storageLevel);
+
+        boolean hasMessages = messages.count() > 0;
+        int iteration = 0;
+
+        while (hasMessages && iteration < maxIterations) {
+          spark.sparkContext().setJobDescription(
+              jobDescriptionPrefix + ": iteration " + (iteration + 1) + maxIterSuffix);
+          prevVertices = currentVertices;
+          prevMessages = messages;
+
+          Column msgKeyCol = prevMessages.col(prevMessages.columns()[0]);
           Dataset<Tuple3<Long, VD, Boolean>> updated = prevVertices
-              .joinWith(prevMessages, prevVertices.col("_1").equalTo(prevMessages.col("key")),
-                  "left_outer")
+              .joinWith(prevMessages, prevVertices.col("_1").equalTo(msgKeyCol), "left_outer")
               .map(
                   (MapFunction<Tuple2<Tuple3<Long, VD, Boolean>, Tuple2<Long, A>>,
                       Tuple3<Long, VD, Boolean>>) pair -> {
@@ -271,54 +322,77 @@ public final class JavaPregel<VD, ED> implements Serializable {
                   },
                   activeVertexEnc);
 
-          Dataset<Tuple3<Long, VD, Boolean>> maybeCheckpointed;
-          if (shouldCheckpoint && (iteration + 1) % checkpointInterval == 0) {
-            maybeCheckpointed = useLocalCheckpoints
+          boolean isCkptIter = shouldCheckpoint && (iteration + 1) % checkpointInterval == 0;
+          boolean didLocalCkpt = isCkptIter && useLocalCheckpoints;
+          if (isCkptIter) {
+            currentVertices = useLocalCheckpoints
                 ? updated.localCheckpoint(true)
-                : updated.checkpoint(true);
+                : updated.checkpoint(true).persist(storageLevel);
           } else {
-            maybeCheckpointed = updated;
+            currentVertices = updated.persist(storageLevel);
           }
-
-          currentVertices = maybeCheckpointed.persist(storageLevel);
 
           if (iteration + 1 < maxIterations) {
             messages = computeMessages(
-                buildActiveTriplets(currentVertices, cachedEdges, true, tripletEnc),
+                buildActiveTriplets(currentVertices, cachedEdgesDF, true, tripletEnc),
                 senderFns,
                 mm,
                 msgPairEnc,
                 msgEncoder)
                 .persist(storageLevel);
-            hasMessages = !messages.isEmpty();
+            hasMessages = messages.count() > 0;
           } else {
-            currentVertices.isEmpty();
+            if (!didLocalCkpt) {
+              currentVertices.count();
+            }
+            messages = null;
             hasMessages = false;
           }
 
           prevMessages.unpersist();
           prevVertices.unpersist();
+          prevMessages = null;
+          prevVertices = null;
           iteration++;
         }
-      } finally {
-        messages.unpersist();
-        cachedEdges.unpersist();
-      }
 
-      Dataset<Tuple2<Long, VD>> finalVertices = currentVertices
-          .map(
-              (MapFunction<Tuple3<Long, VD, Boolean>, Tuple2<Long, VD>>)
-                  v -> new Tuple2<>(v._1(), v._2()),
-              graph.vertexEncoder())
-          .persist(storageLevel);
-      finalVertices.count();
-      currentVertices.unpersist();
-      return JavaGraphDataset.of(finalVertices, graph.edges(), vdEnc, edEnc);
+        spark.sparkContext()
+            .setJobDescription(jobDescriptionPrefix + ": materializing final result");
+        finalVertices = currentVertices
+            .map(
+                (MapFunction<Tuple3<Long, VD, Boolean>, Tuple2<Long, VD>>)
+                    v -> new Tuple2<>(v._1(), v._2()),
+                graph.vertexEncoder())
+            .persist(storageLevel);
+        finalVertices.count();
+        succeeded = true;
+        return JavaGraphDataset.of(finalVertices, graph.edges(), vdEnc, edEnc);
+      } finally {
+        if (!succeeded && finalVertices != null) {
+          finalVertices.unpersist();
+        }
+        if (prevMessages != null) {
+          prevMessages.unpersist();
+        }
+        if (prevVertices != null) {
+          prevVertices.unpersist();
+        }
+        if (messages != null) {
+          messages.unpersist();
+        }
+        if (currentVertices != null) {
+          currentVertices.unpersist();
+        }
+        if (cachedEdgesDF != null) {
+          cachedEdgesDF.unpersist();
+        }
+        spark.sparkContext().setLocalProperty(JOB_DESCRIPTION_KEY, previousJobDescription);
+      }
     }
 
     private Dataset<Tuple5<Long, Long, VD, VD, ED>> buildActiveTriplets(
         Dataset<Tuple3<Long, VD, Boolean>> vv,
-        Dataset<Tuple3<Long, Long, ED>> ee,
+        Dataset<Row> eeDF,
         boolean filterActive,
         Encoder<Tuple5<Long, Long, VD, VD, ED>> tripletEnc) {
       Dataset<Tuple3<Long, VD, Boolean>> srcBase = (filterActive
@@ -335,7 +409,7 @@ public final class JavaPregel<VD, ED> implements Serializable {
       Dataset<Row> srcV = srcBase.toDF("srcId", "srcAttr", "srcActive");
       Dataset<Row> dstV = dstBase.toDF("dstId", "dstAttr", "dstActive");
 
-      Dataset<Row> joined = ee.toDF("srcId", "dstId", "attr")
+      Dataset<Row> joined = eeDF
           .join(srcV, "srcId")
           .join(dstV, "dstId");
 

@@ -30,4 +30,8 @@ class JavaGraphDatasetSuite extends SparkFunSuite with GraphFrameTestSparkContex
   test("typed Java algorithms and traversals") {
     JavaGraphDatasetTest.testAlgorithmsAndTraversals(spark)
   }
+
+  test("Java review regression fixes and edge cases") {
+    JavaGraphDatasetTest.testReviewRegressionFixes(spark)
+  }
 }

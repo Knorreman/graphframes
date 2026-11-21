@@ -26,7 +26,6 @@ import org.graphframes.lib.ConnectedComponentResult;
 import scala.Tuple2;
 import scala.Tuple3;
 
-import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Optional;
@@ -65,7 +64,7 @@ public class GraphDatasetExample {
     }
   }
 
-  public static void main(String[] args) throws IOException {
+  public static void main(String[] args) {
     SparkSession spark = SparkSession.builder()
         .master("local[2]")
         .appName("JavaGraphDatasetExample")
@@ -110,12 +109,14 @@ public class GraphDatasetExample {
           .mergeMsg(Math::max)
           .run();
       maxAges.vertices().show();
+      maxAges.vertices().unpersist();
 
       // Connected Components
       Dataset<ConnectedComponentResult> cc = graph.connectedComponents()
           .setUseLocalCheckpoints(true)
           .run();
       cc.show();
+      cc.unpersist();
     } finally {
       spark.stop();
     }
